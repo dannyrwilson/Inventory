@@ -4,7 +4,7 @@ A photo-first inventory web app for all your parts. It runs as a **Home Assistan
 Raspberry Pi (HA OS) and shows up in the HA sidebar.
 
 - 📸 **Snap to stock**: tap the camera, take a photo, and either create a new item or add stock to one you already have
-- ✨ **AI identification (optional)**: Claude looks at the photo and fills in the name, description, category, part number and tags, and suggests matching items you already own
+- ✨ **AI identification (optional)**: OpenAI (or Claude, if you prefer) looks at the photo and fills in the name, description, category, part number and tags, and suggests matching items you already own
 - 🔎 **Fast search**: SQLite full-text search across names, part numbers (`7805` finds `LM7805`), tags, notes, categories and locations
 - 🔗 **Linked items**: part of / has part, compatible with, replacement for, accessory, requires, related
 - 📍 **Nested locations**: Garage › Shelf A › Bin 3, with photos of each spot
@@ -31,11 +31,13 @@ On the add-on's **Configuration** tab:
 
 | Option | Description |
 | --- | --- |
-| `anthropic_api_key` | Your Anthropic API key (console.anthropic.com). Leave it empty to disable AI. |
-| `ai_model` | Default: `claude-opus-5-5`. Use `claude-haiku-5-5` for cheaper and faster identification. |
+| `ai_provider` | `openai` (default) or `anthropic` |
+| `openai_api_key` | Your OpenAI API key from platform.openai.com → API keys. Leave it empty to disable AI. |
+| `anthropic_api_key` | Only used if `ai_provider` is `anthropic` |
+| `ai_model` | Leave blank for the default (`gpt-5-mini` for OpenAI, `claude-opus-5-5` for Anthropic), or enter any vision-capable model, e.g. `gpt-5`. |
 | `password` | Only needed if you enable the direct port (below). |
 
-Restart the add-on after changing options. Photos are only sent to Anthropic when AI is enabled.
+Restart the add-on after changing options. Photos are only sent to the AI provider when a key is set.
 
 ### Optional: direct access (without the HA sidebar)
 

@@ -364,7 +364,7 @@ route(/^\/$/, async (view) => {
       <button class="row" id="qa-new"><span class="ico" style="background:#34c759">${I.plus}</span><div class="main">New item</div>${I.chev}</button>
       <a class="row" href="#/activity"><span class="ico" style="background:#ff9500">${I.clock}</span><div class="main">Activity</div>${I.chev}</a>
     </div>
-    <div class="help" style="margin-top:10px">${cfg.ai_enabled ? `AI identification on (${esc(cfg.ai_model)})` : "Tip: add an Anthropic API key in the add-on configuration to auto-identify parts from photos."}</div>` : ""}
+    <div class="help" style="margin-top:10px">${cfg.ai_enabled ? `AI identification on (${esc(cfg.ai_model)})` : "Tip: add an OpenAI API key in the add-on configuration to auto-identify parts from photos."}</div>` : ""}
   </div>`;
   $("#addbtn").onclick = () => itemForm();
   const fs = $("#firstsnap"); if (fs) fs.onclick = () => snap("camera");
@@ -1108,7 +1108,7 @@ route(/^\/more$/, async (view) => {
     <div class="help">Your database and photos live in the add-on's /data folder and are included in Home Assistant backups. CSV columns: name, description, category, location (use “Garage &gt; Shelf A”), quantity, unit, min_quantity, part_number, manufacturer, barcode, value, tags, notes, url.</div>
     <div class="section-h">AI photo identification</div>
     <div class="group"><div class="row"><div class="main">Status</div><span class="v">${cfg.ai_enabled ? "On · " + esc(cfg.ai_model) : "Off"}</span></div></div>
-    <div class="help">${cfg.ai_enabled ? "Snapped photos are sent to Anthropic's API for identification." : "Add an Anthropic API key in Settings → Add-ons → Parts Inventory → Configuration to enable."}</div>
+    <div class="help">${cfg.ai_enabled ? `Snapped photos are sent to ${cfg.ai_provider === "anthropic" ? "Anthropic" : "OpenAI"} for identification.` : "Add an OpenAI API key in Settings → Add-ons → Parts Inventory → Configuration to enable."}</div>
     <div class="help" style="margin-top:24px;text-align:center">Parts Inventory · search ${cfg.fts ? "full-text" : "basic"}</div>
     <input type="file" id="csvfile" accept=".csv,text/csv" hidden>
   </div>`;

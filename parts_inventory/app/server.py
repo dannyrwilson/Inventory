@@ -38,15 +38,21 @@ def load_options():
                 opts = json.load(f)
         except Exception as e:  # pragma: no cover
             log.warning("Could not read options.json: %s", e)
+    opts.setdefault("ai_provider", os.environ.get("AI_PROVIDER", "openai"))
+    opts.setdefault("openai_api_key", os.environ.get("OPENAI_API_KEY", ""))
     opts.setdefault("anthropic_api_key", os.environ.get("ANTHROPIC_API_KEY", ""))
-    opts.setdefault("ai_model", os.environ.get("AI_MODEL", "claude-opus-5-5"))
+    opts.setdefault("ai_model", os.environ.get("AI_MODEL", ""))
     opts.setdefault("password", os.environ.get("INVENTORY_PASSWORD", ""))
     return opts
 
 
 OPTS = load_options()
 db = DB(os.path.join(DATA_DIR, "inventory.db"))
-identifier = ai.Identifier(OPTS.get("anthropic_api_key"), OPTS.get("ai_model"))
+_provider = (OPTS.get("ai_provider") or "openai").lower()
+identifier = ai.Identifier(
+    _provider,
+    OPTS.get("anthropic_api_key") if _provider == "anthropic" else OPTS.get("openai_api_key"),
+    OPTS.get("ai_model"))
 
 secret_path = os.path.join(DATA_DIR, ".secret")
 if not os.path.exists(secret_path):
@@ -234,6 +240,7 @@ def config():
     return jsonify({
         "ai_enabled": identifier.enabled,
         "ai_model": identifier.model if identifier.enabled else None,
+        "ai_provider": identifier.provider,
         "relations": [{"key": k, "label": v[0], "inverse": v[1]} for k, v in RELATIONS.items()],
         "fts": db.fts,
     })
@@ -563,7 +570,7 @@ def ai_identify():
         return err("No photo")
     result = {"photos": photo_rows, "suggestion": None, "matches": []}
     if not identifier.enabled:
-        result["error"] = "AI is not configured. Add an Anthropic API key in the add-on configuration."
+        result["error"] = "AI is not configured. Add an OpenAI API key in the add-on configuration."
         return jsonify(result)
     cats = [c["name"] for c in db.q("SELECT name FROM categories ORDER BY name")]
     try:
