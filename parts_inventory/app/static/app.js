@@ -305,7 +305,21 @@ function locationOptions(locs, selected) {
   return `<option value="">None</option>` + sorted.map((l) => `<option value="${l.id}" ${+selected === l.id ? "selected" : ""}>${esc(l.path)}</option>`).join("") + `<option value="__new">New location…</option>`;
 }
 function categoryOptions(cats, selected) {
-  return `<option value="">None</option>` + cats.map((c) => `<option value="${c.id}" ${+selected === c.id ? "selected" : ""}>${esc(c.name)}</option>`).join("") + `<option value="__new">New category…</option>`;
+  const opt = (c, label) => `<option value="${c.id}" ${+selected === c.id ? "selected" : ""}>${esc(label)}</option>`;
+  const tops = cats.filter((c) => !c.parent_id);
+  return `<option value="">None</option>` + tops.map((t) => {
+    const kids = cats.filter((c) => c.parent_id === t.id);
+    if (!kids.length) return opt(t, t.name);
+    return `<optgroup label="${esc(t.name)}">${opt(t, `${t.name} (general)`)}${kids.map((k) => opt(k, k.name)).join("")}</optgroup>`;
+  }).join("") + `<option value="__new">New category…</option>`;
+}
+// match an AI / CSV category ("Group › Sub" or just a name) against existing categories
+function findCat(cats, name) {
+  if (!name) return null;
+  const n = name.toLowerCase().replace(/\s*[>/]\s*/g, " › ").trim();
+  return cats.find((c) => (c.path || c.name).toLowerCase() === n)
+    || cats.find((c) => c.parent_id && c.name.toLowerCase() === n)
+    || cats.find((c) => c.name.toLowerCase() === n) || null;
 }
 
 // ------------------------------------------------------------------ router
@@ -395,7 +409,7 @@ route(/^\/items$/, async (view, _, params) => {
       <button class="chip ${!listState.low && !listState.favorite && !listState.category ? "on" : ""}" data-f="all">All</button>
       <button class="chip ${listState.low ? "on" : ""}" data-f="low">Low stock</button>
       <button class="chip ${listState.favorite ? "on" : ""}" data-f="fav">★ Favorites</button>
-      ${cats.map((c) => `<button class="chip ${+listState.category === c.id ? "on" : ""}" data-c="${c.id}">${c.color ? `<span class="dot" style="background:${esc(c.color)}"></span>` : ""}${esc(c.name)}</button>`).join("")}
+      ${cats.filter((c) => !c.parent_id && c.total_count).map((c) => `<button class="chip ${+listState.category === c.id ? "on" : ""}" data-c="${c.id}">${c.color ? `<span class="dot" style="background:${esc(c.color)}"></span>` : ""}${esc(c.name)}</button>`).join("")}
     </div>
     <div id="count" class="subtitle" style="margin-top:0"></div>
     <div id="results"></div>
@@ -504,6 +518,8 @@ route(/^\/item\/(\d+)$/, async (view, [id]) => {
       <button id="a-more">${I.more}More</button>
     </div>
     ${it.tags.length ? `<div class="tags">${it.tags.map((t) => `<a class="chip" href="#/items?q=${encodeURIComponent(t)}">${esc(t)}</a>`).join("")}</div>` : ""}
+    ${it.compatible.length ? `<div class="section-h">Works with</div><div class="tags">${it.compatible.map((t) => `<a class="chip compat" href="#/items?q=${encodeURIComponent(t)}">${esc(t)}</a>`).join("")}</div>
+      <div id="compat-suggest"></div>` : ""}
     ${kv.length ? `<div class="section-h">Details</div><div class="group kv">${kv.map(([k, v]) => `<div class="row"><span class="k">${k}</span><span class="v2">${k === "Link" ? v : esc(v)}</span></div>`).join("")}</div>` : ""}
     ${it.notes ? `<div class="section-h">Notes</div><div class="group notes">${esc(it.notes)}</div>` : ""}
     <div class="section-h"><span>Linked items</span><a href="#" id="addlink">Add</a></div>
@@ -564,6 +580,26 @@ route(/^\/item\/(\d+)$/, async (view, [id]) => {
   $("#a-link").onclick = link; $("#addlink").onclick = link;
   const al2 = $("#addlink2"); if (al2) al2.onclick = link;
   $("#a-label").onclick = () => printLabels([{ code: `INV:${it.id}`, title: it.name, sub: [it.part_number, it.location_path].filter(Boolean).join(" · ") }]);
+  // suggest owned parts that match "works with" entries
+  if (it.compatible.length) {
+    const linked = new Set(it.links.map((l) => l.id));
+    const seen = new Set([it.id]);
+    const found = [];
+    for (const term of it.compatible.slice(0, 6)) {
+      const r = await GET("api/items?" + new URLSearchParams({ q: term, limit: 4 })).catch(() => null);
+      (r ? r.items : []).forEach((x) => { if (!seen.has(x.id) && !linked.has(x.id)) { seen.add(x.id); found.push({ ...x, why: term }); } });
+    }
+    const box = $("#compat-suggest");
+    if (found.length && box) {
+      box.innerHTML = `<div class="help" style="margin:10px 32px 6px">In your inventory</div><div class="group">${found.slice(0, 6).map((x) => `
+        <div class="row thumb">${picHTML(x.photo)}<a class="main" href="#/item/${x.id}" style="color:var(--text)"><div class="t">${esc(x.name)}</div><div class="s">matches “${esc(x.why)}” · ${fmt(x.quantity)} ${esc(x.unit || "")}</div></a>
+        <button class="btn small gray" data-clink="${x.id}">${I.link.replace("<svg", '<svg style="width:16px;height:16px"')} Link</button></div>`).join("")}</div>`;
+      $$("[data-clink]", box).forEach((b) => (b.onclick = async () => {
+        await POST(`api/items/${it.id}/links`, { target_id: +b.dataset.clink, relation: "compatible" }).catch(fail);
+        haptic(15); toast("Linked as compatible"); refresh();
+      }));
+    }
+  }
   // long-press linked item to unlink
   $$("[data-link]", view).forEach((el) => longPress(el, async () => {
     if (await confirmDanger("Remove link", "Unlink this item?")) { await DEL(`api/links/${el.dataset.link}`).catch(fail); refresh(); }
@@ -648,6 +684,8 @@ async function itemForm(item = {}, opts = {}) {
   let photos = (opts.photos || item.photos || []).map((p) => ({ id: p.id, filename: p.filename }));
   const v = (k) => esc(item[k] ?? "");
   const tagStr = Array.isArray(item.tags) ? item.tags.join(", ") : (item.tags || "");
+  const compatSrc = item.compatible || item.compatible_with || [];
+  const compatStr = Array.isArray(compatSrc) ? compatSrc.join(", ") : compatSrc;
   const s = openSheet({
     title: isNew ? "New Item" : "Edit Item", full: true,
     left: { label: "Cancel", fn: () => s.close() },
@@ -671,6 +709,7 @@ async function itemForm(item = {}, opts = {}) {
         <div class="field"><label>Location</label><select name="location_id">${locationOptions(locs, item.location_id)}</select></div>
         <div class="field"><label>Category</label><select name="category_id">${categoryOptions(cats, item.category_id)}</select></div>
         <div class="field"><label>Tags</label><input name="tags" placeholder="comma, separated" value="${esc(tagStr)}" autocomplete="off"></div>
+        <div class="field"><label>Works with</label><input name="compatible_with" placeholder="e.g. ESP32, 3.3V, XT60" value="${esc(compatStr)}" autocomplete="off"></div>
       </div>
       <div class="section-h">Identification</div>
       <div class="group">
@@ -687,7 +726,7 @@ async function itemForm(item = {}, opts = {}) {
   const f = $("form", s.el);
   const F = (n) => f.elements[n];
   if (opts.categoryName && !item.category_id) {
-    const match = cats.find((c) => c.name.toLowerCase() === opts.categoryName.toLowerCase());
+    const match = findCat(cats, opts.categoryName);
     if (match) F("category_id").value = match.id;
     else {
       const o = document.createElement("option");
@@ -726,7 +765,7 @@ async function itemForm(item = {}, opts = {}) {
   };
   sel("location_id", () => newLocationPrompt());
   sel("category_id", async () => {
-    const n = await promptSheet({ title: "New category", placeholder: "e.g. Fasteners", label: "Create" });
+    const n = await promptSheet({ title: "New category", placeholder: "e.g. Sensors › Temperature", label: "Create" });
     if (!n) return null;
     const c = await POST("api/categories", { name: n }).catch(fail);
     return c && c.id;
@@ -755,7 +794,7 @@ async function itemForm(item = {}, opts = {}) {
 
   async function save() {
     const data = {};
-    ["name", "description", "quantity", "unit", "min_quantity", "value", "tags", "part_number", "manufacturer", "barcode", "url", "notes"].forEach((k) => (data[k] = F(k).value));
+    ["name", "description", "quantity", "unit", "min_quantity", "value", "tags", "compatible_with", "part_number", "manufacturer", "barcode", "url", "notes"].forEach((k) => (data[k] = F(k).value));
     data.location_id = F("location_id").value.startsWith("__") ? null : F("location_id").value || null;
     const cv = F("category_id").value;
     if (cv.startsWith("__name:")) data.category_name = cv.slice(7);
@@ -783,11 +822,12 @@ function applySuggestion(f, sug, cats, overwrite) {
   set("name", sug.name); set("description", sug.description); set("part_number", sug.part_number);
   set("manufacturer", sug.manufacturer); set("barcode", sug.barcode); set("unit", sug.unit);
   if (sug.tags && sug.tags.length) set("tags", sug.tags.join(", "));
+  if (sug.compatible_with && sug.compatible_with.length) set("compatible_with", sug.compatible_with.join(", "));
   if (sug.quantity && f.elements.quantity.value === "1") f.elements.quantity.value = sug.quantity;
   if (sug.category) {
     const sel = f.elements.category_id;
     if (overwrite || !sel.value) {
-      const m = cats.find((c) => c.name.toLowerCase() === sug.category.toLowerCase());
+      const m = findCat(cats, sug.category);
       if (m) sel.value = m.id;
       else {
         let o = $$("option", sel).find((x) => x.value === "__name:" + sug.category);
@@ -900,14 +940,15 @@ async function snap(source) {
   const matches = res.matches || [];
   const newFromPhoto = () => {
     s.close();
-    const base = sug ? { name: sug.name, description: sug.description, part_number: sug.part_number, manufacturer: sug.manufacturer, barcode: sug.barcode || code || "", quantity: sug.quantity || 1, unit: sug.unit || "pcs", tags: sug.tags || [] } : { barcode: code || "" };
+    const base = sug ? { name: sug.name, description: sug.description, part_number: sug.part_number, manufacturer: sug.manufacturer, barcode: sug.barcode || code || "", quantity: sug.quantity || 1, unit: sug.unit || "pcs", tags: sug.tags || [], compatible: sug.compatible_with || [] } : { barcode: code || "" };
     itemForm(base, { photos, categoryName: sug && sug.category, focusName: !sug, aiNote: sug ? `Suggested by AI (${sug.confidence} confidence). Review before saving.` : "" });
   };
   out.innerHTML = `
     ${res.error ? `<div class="help" style="margin:12px 32px;color:var(--orange)">${esc(res.error)}</div>` : ""}
     ${sug ? `<div class="suggest"><div style="display:flex;justify-content:space-between;align-items:center;gap:8px"><div class="n">${esc(sug.name)}</div><span class="conf ${esc(sug.confidence)}">${esc(sug.confidence)}</span></div>
       <div class="d">${esc(sug.description)}</div>
-      <div class="d">${[sug.category, sug.manufacturer, sug.part_number].filter(Boolean).map(esc).join(" · ")}${sug.quantity > 1 ? ` · ${fmt(sug.quantity)} counted` : ""}</div></div>` : ""}
+      <div class="d">${[sug.category, sug.manufacturer, sug.part_number].filter(Boolean).map(esc).join(" · ")}${sug.quantity > 1 ? ` · ${fmt(sug.quantity)} counted` : ""}</div>
+      ${sug.compatible_with && sug.compatible_with.length ? `<div class="d">Works with: ${sug.compatible_with.map(esc).join(", ")}</div>` : ""}</div>` : ""}
     <div class="btnrow" style="margin-top:12px"><button class="btn" id="mknew">${I.plus} New item</button></div>
     ${matches.length ? `<div class="section-h">Already have it? Add to stock</div><div class="group" id="matches">${matches.map((m) => `
       <div class="row thumb" data-id="${m.id}">${picHTML(m.photo)}<div class="main"><div class="t">${esc(m.name)}</div><div class="s">${fmt(m.quantity)} ${esc(m.unit || "")} · ${esc(m.location_path || "No location")}</div></div>
@@ -954,7 +995,7 @@ async function snap(source) {
       const f2 = new FormData(); f2.append("photo_ids", all.map((p) => p.id).join(","));
       const r2 = await POST("api/ai/identify", f2).catch(fail);
       s.close();
-      if (r2) itemForm(r2.suggestion ? { ...r2.suggestion, quantity: r2.suggestion.quantity || 1 } : {}, { photos: all, categoryName: r2.suggestion && r2.suggestion.category });
+      if (r2) itemForm(r2.suggestion ? { ...r2.suggestion, compatible: r2.suggestion.compatible_with || [], quantity: r2.suggestion.quantity || 1 } : {}, { photos: all, categoryName: r2.suggestion && r2.suggestion.category });
     } else { s.close(); itemForm({}, { photos: all, focusName: true }); }
   };
 }
@@ -1080,7 +1121,7 @@ async function boxScan(presetLocation, existingPhotos, existingPreview) {
           photo_ids: photos.map((p) => p.id),
           items: chosen.map((c) => c.mode === "add" ? { add_to_id: c.match.id, quantity: 1 }
             : { name: c.name.trim(), description: c.description, category: c.category, part_number: c.part_number,
-                manufacturer: c.manufacturer, tags: c.tags, label_text: c.label_text, position: c.position, quantity: 1 }),
+                manufacturer: c.manufacturer, tags: c.tags, compatible_with: c.compatible_with, label_text: c.label_text, position: c.position, quantity: 1 }),
         });
         invalidate(); haptic(20); s.close();
         const msg = [r.created.length ? `Added ${r.created.length} item${r.created.length === 1 ? "" : "s"}` : "", r.stocked.length ? `stocked ${r.stocked.length}` : ""].filter(Boolean).join(", ");
@@ -1203,6 +1244,7 @@ route(/^\/more$/, async (view) => {
     <div class="largetitle">More</div>
     <div class="group">
       <a class="row" href="#/categories"><span class="ico" style="background:#af52de">${I.tag}</span><div class="main">Categories</div><span class="v">${s.categories}</span>${I.chev}</a>
+      ${cfg.ai_enabled ? `<button class="row" id="autocat"><span class="ico" style="background:#bf5af2">${I.sparkle}</span><div class="main">Auto-categorize items</div>${I.chev}</button>` : ""}
       <a class="row" href="#/activity"><span class="ico" style="background:#ff9500">${I.clock}</span><div class="main">Activity</div>${I.chev}</a>
       <a class="row" href="#/items?low=1"><span class="ico" style="background:#ff3b30">${I.alert}</span><div class="main">Low stock</div><span class="v">${s.low || 0}</span>${I.chev}</a>
       <button class="row" id="scan"><span class="ico" style="background:#5856d6">${I.qr}</span><div class="main">Scan label / barcode</div>${I.chev}</button>
@@ -1225,6 +1267,7 @@ route(/^\/more$/, async (view) => {
     <input type="file" id="csvfile" accept=".csv,text/csv" hidden>
   </div>`;
   $("#scan").onclick = () => scanFlow();
+  const ac = $("#autocat"); if (ac) ac.onclick = () => autoCategorize();
   $("#import").onclick = () => $("#csvfile").click();
   $("#csvfile").onchange = async (e) => {
     const f = e.target.files[0]; if (!f) return;
@@ -1240,9 +1283,45 @@ route(/^\/categories$/, async (view) => {
   const colors = ["#ff3b30", "#ff9500", "#ffcc00", "#34c759", "#00c7be", "#0a84ff", "#5856d6", "#af52de", "#ff2d55", "#a2845e", "#8e8e93"];
   view.innerHTML = `<div class="page">${topbar({ title: "Categories", back: "More", right: `<button class="navbtn" id="addcat">${I.plus}</button>` })}
     <div class="largetitle">Categories</div>
-    ${cats.length ? `<div class="group">${cats.map((c) => `<div class="row" data-id="${c.id}"><span class="dot" style="width:14px;height:14px;background:${esc(c.color || "var(--fill2)")}"></span><a class="main" href="#/items?category=${c.id}" style="color:var(--text)">${esc(c.name)}</a><span class="v">${c.item_count}</span><button class="navbtn" data-edit="${c.id}">${I.more}</button></div>`).join("")}</div>`
+    <div class="btnrow" style="margin-bottom:12px">
+      ${(await config()).ai_enabled ? `<button class="btn gray small" id="autocat">${I.sparkle} Auto-categorize</button>` : ""}
+      <button class="btn gray small" id="defcats">${I.tag} Restore standard set</button>
+    </div>
+    <div class="searchbar">${I.search}<input id="catq" type="search" placeholder="Filter categories" autocomplete="off"></div>
+    ${cats.length ? `<div class="group" id="cattree">${cats.filter((c) => !c.parent_id).map((t) => {
+      const kids = cats.filter((c) => c.parent_id === t.id);
+      return `<div class="catgroup" data-name="${esc(t.name.toLowerCase())}">
+        <div class="row" data-id="${t.id}"><button class="navbtn expander" data-exp="${t.id}" ${kids.length ? "" : 'style="visibility:hidden"'}>${I.chev}</button><span class="dot" style="width:14px;height:14px;background:${esc(t.color || "var(--fill2)")}"></span><a class="main" href="#/items?category=${t.id}" style="color:var(--text);font-weight:600">${esc(t.name)}</a><span class="v">${t.total_count || ""}</span><button class="navbtn" data-edit="${t.id}">${I.more}</button></div>
+        <div class="catkids" hidden>${kids.map((k) => `<div class="row sub" data-name="${esc(k.name.toLowerCase())}"><a class="main" href="#/items?category=${k.id}" style="color:var(--text)">${esc(k.name)}</a><span class="v">${k.item_count || ""}</span><button class="navbtn" data-edit="${k.id}">${I.more}</button></div>`).join("")}
+          <button class="row sub center" data-addsub="${t.id}">${I.plus} Add sub-category</button></div>
+      </div>`;
+    }).join("")}</div>`
       : `<div class="empty">${I.tag}<div>No categories yet</div></div>`}
   </div>`;
+  const ac = $("#autocat"); if (ac) ac.onclick = () => autoCategorize();
+  $$("[data-exp]", view).forEach((b) => (b.onclick = () => {
+    const kids = b.closest(".catgroup").querySelector(".catkids");
+    kids.hidden = !kids.hidden; b.classList.toggle("open", !kids.hidden);
+  }));
+  $$("[data-addsub]", view).forEach((b) => (b.onclick = async () => {
+    const n = await promptSheet({ title: "New sub-category", placeholder: "Name", label: "Create" });
+    if (n) { await POST("api/categories", { name: n, parent_id: +b.dataset.addsub }).catch(fail); invalidate(); refresh(); }
+  }));
+  const cq = $("#catq");
+  if (cq) cq.oninput = () => {
+    const v = cq.value.toLowerCase().trim();
+    $$(".catgroup", view).forEach((g) => {
+      const subs = $$(".row.sub[data-name]", g);
+      let any = !v || g.dataset.name.includes(v);
+      subs.forEach((r) => { const hit = !v || r.dataset.name.includes(v) || g.dataset.name.includes(v); r.style.display = hit ? "" : "none"; any = any || hit; });
+      g.style.display = any ? "" : "none";
+      const kids = $(".catkids", g); kids.hidden = !v; $(".expander", g).classList.toggle("open", !!v);
+    });
+  };
+  $("#defcats").onclick = async () => {
+    const r = await POST("api/categories/defaults").catch(fail);
+    if (r) { invalidate(); toast(r.added ? `Added ${r.added} missing categories` : "You already have them all"); refresh(); }
+  };
   $("#addcat").onclick = async () => {
     const n = await promptSheet({ title: "New category", placeholder: "e.g. Electronics", label: "Create" });
     if (n) { await POST("api/categories", { name: n, color: colors[cats.length % colors.length] }).catch(fail); invalidate(); refresh(); }
@@ -1258,10 +1337,48 @@ route(/^\/categories$/, async (view) => {
       const i = await actionSheet(colors.map((col, k) => ({ label: names[k], value: col, icon: `<span class="dot" style="width:14px;height:14px;margin-right:10px;background:${col}"></span>` })), "Pick a color");
       if (i) { await PUT(`api/categories/${c.id}`, { name: c.name, color: i }).catch(fail); invalidate(); refresh(); }
     } else if (v === "del") {
-      if (await confirmDanger("Delete category", "Items keep existing, just uncategorized.")) { await DEL(`api/categories/${c.id}`).catch(fail); invalidate(); refresh(); }
+      if (await confirmDanger("Delete category", c.parent_id ? "Items keep existing, just uncategorized." : "Deletes this group and its sub-categories. Items keep existing, just uncategorized.")) { await DEL(`api/categories/${c.id}`).catch(fail); invalidate(); refresh(); }
     }
   }));
 }, "more");
+
+// ------------------------------------------------------------------ auto-categorize
+async function autoCategorize() {
+  const scope = await actionSheet([
+    { label: "Only uncategorized items", value: "uncategorized" },
+    { label: "Re-check every item", value: "all" },
+  ], "AI sorts items into categories. You review before anything changes.");
+  if (!scope) return;
+  const s = openSheet({
+    title: "Auto-categorize", full: true,
+    left: { label: "Cancel", fn: () => s.close() },
+    body: `<div class="status" style="padding-top:40px"><span class="spinner"></span> Sorting your parts…</div>`,
+  });
+  let res;
+  try { res = await POST("api/ai/categorize", { scope }); }
+  catch (e) { s.content.innerHTML = `<div class="empty">${I.alert}<div>${esc(e.message)}</div></div>`; return; }
+  const props = res.proposals.map((p) => ({ ...p, on: true }));
+  if (!props.length) { s.content.innerHTML = `<div class="empty">${I.tag}<div>Everything is already categorized nicely.</div></div>`; return; }
+  const draw = () => {
+    const groups = {};
+    props.forEach((p, i) => (groups[p.category] = groups[p.category] || []).push(i));
+    const n = props.filter((p) => p.on).length;
+    s.content.innerHTML = `<div class="subtitle" style="margin:8px 16px">${props.length} suggestion${props.length === 1 ? "" : "s"}. Untick anything you disagree with.</div>
+      ${Object.keys(groups).sort().map((g) => `<div class="section-h">${esc(g)}</div><div class="group">${groups[g].map((i) => {
+        const p = props[i];
+        return `<div class="row thumb brow ${p.on ? "" : "off"}"><button class="check ${p.on ? "on" : ""}" data-i="${i}">✓</button>${picHTML(p.photo)}
+          <div class="main"><div class="t">${esc(p.name)}</div><div class="s">${p.current ? `was ${esc(p.current)}` : "uncategorized"}</div></div></div>`;
+      }).join("")}</div>`).join("")}
+      <div style="height:90px"></div>
+      <div class="sticky-cta"><button class="btn block" id="apply" ${n ? "" : "disabled"}>${I.sparkle} Apply ${n}</button></div>`;
+    $$("[data-i]", s.content).forEach((b) => (b.onclick = () => { haptic(); props[+b.dataset.i].on = !props[+b.dataset.i].on; draw(); }));
+    $("#apply", s.content).onclick = async () => {
+      const r = await POST("api/ai/categorize/apply", { assignments: props.filter((p) => p.on).map((p) => ({ id: p.id, category: p.category })) }).catch(fail);
+      if (r) { invalidate(); s.close(); toast(`Categorized ${r.updated} item${r.updated === 1 ? "" : "s"}`); refresh(); }
+    };
+  };
+  draw();
+}
 
 // ------------------------------------------------------------------ boot
 render();

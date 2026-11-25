@@ -336,3 +336,13 @@ img { display: block; }
 .pill.new { background: rgba(10,132,255,.15); color: var(--accent); }
 .pill.add { background: rgba(48,177,88,.16); color: var(--green); }
 .sticky-cta { position: sticky; bottom: 0; padding: 12px 16px calc(var(--safe-b) + 8px); background: linear-gradient(to top, var(--bg) 70%, transparent); }
+
+/* category tree */
+.catgroup + .catgroup { border-top: .5px solid var(--sep); }
+.catgroup .row::before { display: none; }
+.row.sub { padding-left: 62px; min-height: 42px; font-size: 16px; }
+.row.sub + .row.sub::before { display: block; left: 62px; }
+.expander { padding: 4px; margin: 0 -6px 0 -8px; }
+.expander svg { transition: transform .2s; color: var(--text2); }
+.expander.open svg { transform: rotate(90deg); }
+.chip.compat { background: rgba(48,177,88,.14); color: var(--green); }

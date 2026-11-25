@@ -1,3 +1,9 @@
+## 1.3.0
+- Built-in two-level category tree (26 groups / 326 sub-categories), pre-loaded on first start.
+- Auto-categorize: items saved without a category are sorted in the background; bulk review screen.
+- New "Works with" field: AI lists compatibility (boards, voltages, interfaces, connectors) and the
+  item page suggests owned parts to link as compatible.
+
 ## 1.2.0
 - Scan a whole picking/organizer box: AI reads every compartment label and adds each as an item
   with stock 1 (review list, rename, skip, or +1 items you already have; choose a location).

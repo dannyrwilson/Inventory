@@ -6,6 +6,8 @@ Raspberry Pi (HA OS) and shows up in the HA sidebar.
 - 📸 **Snap to stock**: tap the camera, take a photo, and either create a new item or add stock to one you already have
 - ✨ **AI identification (optional)**: OpenAI (or Claude, if you prefer) looks at the photo and fills in the name, description, category, part number and tags, and suggests matching items you already own
 - 🗃️ **Scan a whole picking box**: one photo of an organizer box, and AI reads every compartment label and adds them all (stock 1 each)
+- 🗂️ **Auto-categorised** into a built-in two-level tree (26 groups, 326 sub-categories like *Sensors › Temperature*, *Fasteners & Fixings › Nuts*). Anything saved without a category is sorted automatically
+- 🔌 **Works with**: AI notes what each part is compatible with (ESP32, 3.3V, I2C, XT60, M3…) and suggests matching parts you own to link
 - 🔎 **Fast search**: SQLite full-text search across names, part numbers (`7805` finds `LM7805`), tags, notes, categories and locations
 - 🔗 **Linked items**: part of / has part, compatible with, replacement for, accessory, requires, related
 - 📍 **Nested locations**: Garage › Shelf A › Bin 3, with photos of each spot
@@ -35,6 +37,7 @@ On the add-on's **Configuration** tab:
 | `ai_provider` | `openai` (default) or `anthropic` |
 | `openai_api_key` | Your OpenAI API key from platform.openai.com → API keys. Leave it empty to disable AI. |
 | `anthropic_api_key` | Only used if `ai_provider` is `anthropic` |
+| `auto_categorize` | `true` (default): items saved without a category get one automatically |
 | `ai_model` | Leave blank for the default (`gpt-5-mini` for OpenAI, `claude-opus-5-5` for Anthropic), or enter any vision-capable model, e.g. `gpt-5`. |
 | `password` | Only needed if you enable the direct port (below). |
 
@@ -59,6 +62,8 @@ Access through the HA sidebar never asks for this password.
   parts and *Label* to print a QR label. Long-press a linked item to unlink it.
 - **Places**: build your location tree and add a photo of each shelf or bin. You can print labels for a
   location and for everything in it.
+- **Categories** (More → Categories): browse or filter the tree, add sub-categories, *Auto-categorize* to
+  review AI suggestions for uncategorised items or re-check everything, and *Restore standard set*.
 - **More**: categories, activity, inventory value, and CSV/JSON import and export.
 
 ## Development

@@ -8,6 +8,7 @@ import logging
 import os
 import secrets
 import sys
+import threading
 import time
 import uuid
 
@@ -17,6 +18,7 @@ from PIL import Image, ImageOps
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from db import DB, RELATIONS, ITEM_FIELDS, now  # noqa: E402
 import ai  # noqa: E402
+import taxonomy  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("inventory")
@@ -42,6 +44,7 @@ def load_options():
     opts.setdefault("openai_api_key", os.environ.get("OPENAI_API_KEY", ""))
     opts.setdefault("anthropic_api_key", os.environ.get("ANTHROPIC_API_KEY", ""))
     opts.setdefault("ai_model", os.environ.get("AI_MODEL", ""))
+    opts.setdefault("auto_categorize", True)
     opts.setdefault("password", os.environ.get("INVENTORY_PASSWORD", ""))
     return opts
 
@@ -170,15 +173,52 @@ def cleanup_orphans():
         log.info("Removed %d orphan uploads", len(rows))
 
 
-def get_or_create_category(name):
-    name = (name or "").strip()
-    if not name:
+def split_category(path):
+    return [p.strip() for p in str(path or "").replace("›", ">").replace("/", ">").split(">") if p.strip()][:2]
+
+
+def get_or_create_category(path):
+    """Accepts 'Parent › Child', 'Parent > Child' or a single name."""
+    parts = split_category(path)
+    if not parts:
         return None
-    r = db.one("SELECT id FROM categories WHERE name=? COLLATE NOCASE", (name,))
+    if len(parts) == 1:
+        name = parts[0]
+        # an existing sub-category with this name wins, then a top-level one
+        r = db.one("SELECT id FROM categories WHERE name=? AND parent_id IS NOT NULL ORDER BY id", (name,)) or \
+            db.one("SELECT id FROM categories WHERE name=? AND parent_id IS NULL", (name,))
+        if r:
+            return r["id"]
+        with db.tx() as c:
+            return c.execute("INSERT INTO categories(name, created_at) VALUES (?,?)", (name, now())).lastrowid
+    parent, child = parts
+    pr = db.one("SELECT id FROM categories WHERE name=? AND parent_id IS NULL", (parent,))
+    if pr:
+        pid = pr["id"]
+    else:
+        with db.tx() as c:
+            pid = c.execute("INSERT INTO categories(name, created_at) VALUES (?,?)", (parent, now())).lastrowid
+    r = db.one("SELECT id FROM categories WHERE name=? AND parent_id=?", (child, pid))
     if r:
         return r["id"]
     with db.tx() as c:
-        return c.execute("INSERT INTO categories(name, created_at) VALUES (?,?)", (name, now())).lastrowid
+        return c.execute("INSERT INTO categories(name, parent_id, created_at) VALUES (?,?,?)",
+                         (child, pid, now())).lastrowid
+
+
+def category_paths():
+    """Every assignable category as 'Parent › Child' (or 'Parent' when it has no children)."""
+    rows = db.q("""SELECT c.name, p.name AS parent,
+                     (SELECT COUNT(*) FROM categories k WHERE k.parent_id=c.id) AS kids
+                   FROM categories c LEFT JOIN categories p ON p.id=c.parent_id
+                   ORDER BY COALESCE(p.name, c.name), c.parent_id IS NOT NULL, c.name""")
+    return [f'{r["parent"]} › {r["name"]}' if r["parent"] else r["name"] for r in rows
+            if r["parent"] or not r["kids"]]
+
+
+def category_item_ids(cid):
+    return [r["id"] for r in db.q("SELECT id FROM items WHERE category_id IN "
+                                  "(SELECT id FROM categories WHERE id=? OR parent_id=?)", (cid, cid))]
 
 
 def get_or_create_location_path(path):
@@ -193,6 +233,105 @@ def get_or_create_location_path(path):
                 parent = c.execute("INSERT INTO locations(name, parent_id, created_at) VALUES (?,?,?)",
                                    (p, parent, now())).lastrowid
     return parent
+
+
+# ------------------------------------------------------ default categories
+
+
+def add_default_categories():
+    """Add any missing groups / sub-categories from the built-in tree."""
+    added = 0
+    for parent, color, children in taxonomy.TREE:
+        pr = db.one("SELECT id, color FROM categories WHERE name=? AND parent_id IS NULL", (parent,))
+        with db.tx() as c:
+            if pr:
+                pid = pr["id"]
+                if not pr["color"]:
+                    c.execute("UPDATE categories SET color=? WHERE id=?", (color, pid))
+            else:
+                pid = c.execute("INSERT INTO categories(name, color, created_at) VALUES (?,?,?)",
+                                (parent, color, now())).lastrowid
+                added += 1
+            for child in children:
+                if not c.execute("SELECT 1 FROM categories WHERE name=? AND parent_id=?", (child, pid)).fetchone():
+                    c.execute("INSERT INTO categories(name, parent_id, created_at) VALUES (?,?,?)",
+                              (child, pid, now()))
+                    added += 1
+    return added
+
+
+# first run only: deleting them later won't bring them back
+if not db.one("SELECT value FROM meta WHERE key='seeded_taxonomy'"):
+    add_default_categories()
+    with db.tx() as c:
+        c.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('seeded_taxonomy', '1')")
+
+
+# ------------------------------------------------------- auto-categorize
+def categorize_items(ids):
+    """Ask the AI for categories for the given item ids. Returns {id: category_name}."""
+    out = {}
+    cats = category_paths()
+    for i in range(0, len(ids), 80):
+        chunk = ids[i:i + 80]
+        rows = db.q("SELECT id, name, description, part_number, manufacturer, tags FROM items "
+                    "WHERE id IN (%s)" % ",".join("?" * len(chunk)), chunk)
+        got = identifier.categorize(rows, cats)
+        out.update(got)
+        cats = sorted(set(cats) | set(got.values()), key=str.lower)  # keep later chunks consistent
+    return out
+
+
+def apply_categories(assignments):
+    n = 0
+    for item_id, name in assignments.items():
+        cid = get_or_create_category(name)
+        if cid:
+            with db.tx() as c:
+                c.execute("UPDATE items SET category_id=? WHERE id=?", (cid, int(item_id)))
+            db.reindex(int(item_id))
+            n += 1
+    return n
+
+
+class AutoCategorizer:
+    """Background worker: items saved without a category get one a few seconds later."""
+
+    def __init__(self):
+        self.wake = threading.Event()
+        self.tried = set()  # don't retry items the AI already couldn't place
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def poke(self):
+        if identifier.enabled and OPTS.get("auto_categorize", True):
+            self.wake.set()
+
+    def run(self):
+        while True:
+            self.wake.wait()
+            time.sleep(4)  # let bursts (imports, box scans) settle into one request
+            self.wake.clear()
+            try:
+                ids = [r["id"] for r in db.q("SELECT id FROM items WHERE category_id IS NULL "
+                                             "ORDER BY id DESC LIMIT 200") if r["id"] not in self.tried]
+                if not ids:
+                    continue
+                self.tried.update(ids)
+                n = apply_categories(categorize_items(ids))
+                log.info("Auto-categorized %d item(s)", n)
+            except Exception as e:
+                log.warning("Auto-categorize failed: %s", ai.friendly_error(e))
+
+
+auto_cat = AutoCategorizer()
+
+
+@app.after_request
+def poke_categorizer(resp):
+    if request.method in ("POST", "PUT", "PATCH") and resp.status_code < 300 and \
+            (request.path.startswith("/api/items") or request.path == "/api/import.csv"):
+        auto_cat.poke()
+    return resp
 
 
 # ------------------------------------------------------------------ static
@@ -480,8 +619,20 @@ def location_photo(loc_id):
 # categories
 @app.get("/api/categories")
 def list_categories():
-    return jsonify(db.q("SELECT c.*, (SELECT COUNT(*) FROM items i WHERE i.category_id=c.id) AS item_count "
-                        "FROM categories c ORDER BY name COLLATE NOCASE"))
+    rows = db.q("""SELECT c.*, p.name AS parent_name, COALESCE(NULLIF(c.color, ''), p.color) AS color,
+                     (SELECT COUNT(*) FROM items i WHERE i.category_id=c.id) AS item_count
+                   FROM categories c LEFT JOIN categories p ON p.id=c.parent_id
+                   ORDER BY COALESCE(p.name, c.name) COLLATE NOCASE, c.parent_id IS NOT NULL,
+                            c.name COLLATE NOCASE""")
+    totals = {}
+    for r in rows:
+        r["path"] = f'{r["parent_name"]} › {r["name"]}' if r["parent_name"] else r["name"]
+        totals[r["id"]] = totals.get(r["id"], 0) + r["item_count"]
+        if r["parent_id"]:
+            totals[r["parent_id"]] = totals.get(r["parent_id"], 0) + r["item_count"]
+    for r in rows:
+        r["total_count"] = totals.get(r["id"], 0)
+    return jsonify(rows)
 
 
 @app.post("/api/categories")
@@ -490,11 +641,20 @@ def create_category():
     name = (d.get("name") or "").strip()
     if not name:
         return err("Name is required")
+    if d.get("parent_id"):
+        parent = db.one("SELECT name FROM categories WHERE id=? AND parent_id IS NULL", (int(d["parent_id"]),))
+        if parent:
+            name = f'{parent["name"]} › {name}'
     cid = get_or_create_category(name)
     if d.get("color"):
         with db.tx() as c:
             c.execute("UPDATE categories SET color=? WHERE id=?", (d["color"], cid))
     return jsonify(db.one("SELECT * FROM categories WHERE id=?", (cid,))), 201
+
+
+@app.post("/api/categories/defaults")
+def categories_defaults():
+    return jsonify({"added": add_default_categories()})
 
 
 @app.put("/api/categories/<int:cid>")
@@ -507,14 +667,14 @@ def update_category(cid):
         with db.tx() as c:
             c.execute("UPDATE categories SET name=?, color=? WHERE id=?", (name, d.get("color", ""), cid))
     except Exception:
-        return err("A category with that name exists")
-    db.reindex_many([r["id"] for r in db.q("SELECT id FROM items WHERE category_id=?", (cid,))])
+        return err("Could not rename")
+    db.reindex_many(category_item_ids(cid))
     return jsonify(db.one("SELECT * FROM categories WHERE id=?", (cid,)))
 
 
 @app.delete("/api/categories/<int:cid>")
 def delete_category(cid):
-    ids = [r["id"] for r in db.q("SELECT id FROM items WHERE category_id=?", (cid,))]
+    ids = category_item_ids(cid)  # sub-categories are deleted too
     with db.tx() as c:
         c.execute("DELETE FROM categories WHERE id=?", (cid,))
     db.reindex_many(ids)
@@ -575,7 +735,7 @@ def ai_identify():
     if not identifier.enabled:
         result["error"] = "AI is not configured. Add an OpenAI API key in the add-on configuration."
         return jsonify(result)
-    cats = [c["name"] for c in db.q("SELECT name FROM categories ORDER BY name")]
+    cats = category_paths()
     try:
         sug = identifier.identify([os.path.join(PHOTO_DIR, p["filename"]) for p in photo_rows],
                                   cats, request.form.get("hint", ""))
@@ -629,7 +789,7 @@ def ai_identify_box():
     if not identifier.enabled:
         result["error"] = "AI is not configured. Add an OpenAI API key in the add-on configuration."
         return jsonify(result)
-    cats = [c["name"] for c in db.q("SELECT name FROM categories ORDER BY name")]
+    cats = category_paths()
     try:
         found, model = identifier.identify_box(
             [os.path.join(PHOTO_DIR, p["filename"]) for p in photo_rows], cats, request.form.get("hint", ""))
@@ -674,7 +834,8 @@ def create_items_batch():
                 db.reindex(int(e["add_to_id"]))
                 stocked.append(int(e["add_to_id"]))
             continue
-        data = {k: e.get(k) for k in ("name", "description", "part_number", "manufacturer", "tags") if e.get(k)}
+        data = {k: e.get(k) for k in ("name", "description", "part_number", "manufacturer", "tags",
+                                      "compatible_with") if e.get(k)}
         if not data.get("name"):
             continue
         notes = []
@@ -707,9 +868,41 @@ def create_items_batch():
     return jsonify({"created": created, "stocked": stocked})
 
 
+@app.post("/api/ai/categorize")
+def ai_categorize():
+    """Propose categories. scope: 'uncategorized' (default) or 'all'."""
+    if not identifier.enabled:
+        return err("AI is not configured. Add an OpenAI API key in the add-on configuration.")
+    scope = body().get("scope", "uncategorized")
+    sql = "SELECT id FROM items" + ("" if scope == "all" else " WHERE category_id IS NULL") + " ORDER BY id"
+    ids = [r["id"] for r in db.q(sql)][:800]
+    if not ids:
+        return jsonify({"proposals": []})
+    try:
+        got = categorize_items(ids)
+    except Exception as e:
+        log.exception("Categorize failed")
+        return err(ai.friendly_error(e), 502)
+    rows = {r["id"]: r for r in db.q(db.item_row_sql() + " WHERE i.id IN (%s)" % ",".join("?" * len(ids)), ids)}
+    props = []
+    for item_id, cat in got.items():
+        r = rows.get(item_id)
+        if r and (r["category_name"] or "").lower() != cat.lower():
+            props.append({"id": item_id, "name": r["name"], "photo": r["photo"],
+                          "current": r["category_name"], "category": cat})
+    return jsonify({"proposals": props})
+
+
+@app.post("/api/ai/categorize/apply")
+def ai_categorize_apply():
+    a = {int(x["id"]): x["category"] for x in body().get("assignments", []) if x.get("category")}
+    return jsonify({"updated": apply_categories(a)})
+
+
 # import / export
 EXPORT_COLS = ["id", "name", "description", "category", "location", "quantity", "unit", "min_quantity",
-               "part_number", "manufacturer", "barcode", "value", "tags", "notes", "url", "favorite"]
+               "part_number", "manufacturer", "barcode", "value", "tags", "notes", "url", "favorite",
+               "compatible_with"]
 
 
 @app.get("/api/export.csv")
@@ -723,7 +916,7 @@ def export_csv():
                     (r.get("location_path") or "").replace(" › ", " > "), r["quantity"], r["unit"],
                     "" if r["min_quantity"] is None else r["min_quantity"], r["part_number"],
                     r["manufacturer"], r["barcode"], "" if r["value"] is None else r["value"],
-                    ",".join(r["tags"]), r["notes"], r["url"], r["favorite"]])
+                    ",".join(r["tags"]), r["notes"], r["url"], r["favorite"], ",".join(r["compatible"])])
     return Response(buf.getvalue(), mimetype="text/csv",
                     headers={"Content-Disposition": "attachment; filename=inventory.csv"})
 

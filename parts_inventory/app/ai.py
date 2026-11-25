@@ -20,11 +20,12 @@ SCHEMA = {
         "quantity": {"type": "number"},
         "unit": {"type": "string"},
         "tags": {"type": "array", "items": {"type": "string"}},
+        "compatible_with": {"type": "array", "items": {"type": "string"}},
         "search_keywords": {"type": "array", "items": {"type": "string"}},
         "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
     },
     "required": ["name", "description", "category", "manufacturer", "part_number",
-                 "barcode", "quantity", "unit", "tags", "search_keywords", "confidence"],
+                 "barcode", "quantity", "unit", "tags", "compatible_with", "search_keywords", "confidence"],
     "additionalProperties": False,
 }
 
@@ -40,6 +41,11 @@ Return:
 - quantity: how many of the item you can count in the photo (1 if unsure; count packs as 1 unless contents are visible).
 - unit: "pcs" unless something else is clearly better (m, ft, g, ml, roll, box, pack).
 - tags: 2-6 short lowercase tags.
+- compatible_with: what this part works with, fits or is meant for: boards and platforms (ESP32,
+  Arduino, Raspberry Pi), voltages / cell counts (3.3V logic, 5V, 2-4S LiPo), interfaces and
+  protocols (I2C, SPI, UART, PWM, Zigbee), connectors and standards (XT60, JST-PH 2.0, M3 thread,
+  1.75mm filament, 608 bearing), or specific devices / printers / drones. 2-8 short entries;
+  empty list if nothing sensible applies.
 - search_keywords: 3-8 words someone might use to search for this item, including synonyms.
 - confidence: how sure you are about the identification."""
 
@@ -60,9 +66,10 @@ BATCH_SCHEMA = {
                     "manufacturer": {"type": "string"},
                     "part_number": {"type": "string"},
                     "tags": {"type": "array", "items": {"type": "string"}},
+                    "compatible_with": {"type": "array", "items": {"type": "string"}},
                 },
                 "required": ["label_text", "position", "name", "description", "category",
-                             "manufacturer", "part_number", "tags"],
+                             "manufacturer", "part_number", "tags", "compatible_with"],
                 "additionalProperties": False,
             },
         },
@@ -86,7 +93,46 @@ For each labelled compartment return:
   category for the whole box when the parts are all the same kind.
 - manufacturer, part_number: only if written on the label; empty string otherwise.
 - tags: 1-4 short lowercase tags.
+- compatible_with: 0-5 short entries for what it fits / works with (e.g. "M3 thread", "XT60",
+  "3.3V logic", "ESP32"), only when the label makes it clear; otherwise an empty list.
 Skip empty, unlabelled compartments unless their contents are clearly identifiable."""
+
+
+CATEGORY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "assignments": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"id": {"type": "integer"}, "category": {"type": "string"}},
+                "required": ["id", "category"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["assignments"],
+    "additionalProperties": False,
+}
+
+CATEGORY_SYSTEM = """You organise a personal workshop / electronics parts inventory.
+The inventory uses a two-level category tree written as "Group › Sub-category".
+Assign exactly one category to every item you are given, returning its id unchanged.
+
+Rules:
+- Pick the single most specific matching entry from the category list and copy it exactly,
+  e.g. "Sensors › Temperature", "Fasteners & Fixings › Nuts", "Cables & Connectors › XT60 Connectors".
+- Only if nothing fits, keep an existing group and add a short new sub-category in the same style
+  ("Group › New Sub-category"). Never invent a new group when an existing one is close.
+- Use the same category for the same kind of part every time."""
+
+SHARED_CATEGORY_RULE = """
+Category: choose the most specific entry from the category list, written exactly as \
+"Group › Sub-category" (e.g. "Sensors › Temperature"). Only if nothing fits, use an existing \
+group with a short new sub-category."""
+
+SYSTEM += SHARED_CATEGORY_RULE
+BATCH_SYSTEM += SHARED_CATEGORY_RULE
 
 
 def prepare_image(path, max_side=1568):
@@ -131,7 +177,7 @@ class Identifier:
     def _prompt(categories, hint):
         text = "Identify this item for my inventory."
         if categories:
-            text += "\nExisting categories: " + ", ".join(categories[:80])
+            text += "\nCategory list:\n" + "\n".join(categories)
         if hint:
             text += "\nUser hint: " + hint[:500]
         return text
@@ -147,13 +193,27 @@ class Identifier:
         """Read every labelled compartment in an organizer / picking box."""
         text = "List every labelled compartment in this box."
         if categories:
-            text += "\nExisting categories: " + ", ".join(categories[:80])
+            text += "\nCategory list:\n" + "\n".join(categories)
         if hint:
             text += "\nUser hint: " + hint[:500]
         # bigger images so small labels stay legible
         data, model = self._call(image_paths[:3], text, BATCH_SYSTEM, BATCH_SCHEMA,
                                  "box_contents", max_side=2048, timeout=300.0)
         return data.get("items") or [], model
+
+    def categorize(self, items, categories=()):
+        """Text-only: assign a category to each item. items: [{id, name, ...}]"""
+        lines = []
+        for it in items:
+            extra = " | ".join(x for x in [it.get("description"), it.get("part_number"),
+                                           it.get("manufacturer"), it.get("tags")] if x)
+            lines.append(f'{it["id"]}: {it["name"]}' + (f" ({extra[:200]})" if extra else ""))
+        text = ("Category list:\n" + ("\n".join(categories) if categories else "(none yet)") +
+                "\n\nItems:\n" + "\n".join(lines))
+        data, _ = self._call([], text, CATEGORY_SYSTEM, CATEGORY_SCHEMA, "categories", timeout=180.0)
+        valid = {it["id"] for it in items}
+        return {a["id"]: a["category"].strip() for a in data.get("assignments", [])
+                if a.get("id") in valid and a.get("category", "").strip()}
 
     def _call(self, image_paths, text, system, schema, name, max_side=1568, timeout=120.0):
         if self.provider == "openai":

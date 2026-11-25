@@ -15,7 +15,8 @@ CREATE TABLE IF NOT EXISTS locations (
 );
 CREATE TABLE IF NOT EXISTS categories (
     id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    name TEXT NOT NULL COLLATE NOCASE,
+    parent_id INTEGER REFERENCES categories(id) ON DELETE CASCADE,
     color TEXT DEFAULT '',
     created_at INTEGER NOT NULL
 );
@@ -35,6 +36,7 @@ CREATE TABLE IF NOT EXISTS items (
     tags TEXT DEFAULT '',
     notes TEXT DEFAULT '',
     url TEXT DEFAULT '',
+    compatible_with TEXT DEFAULT '',
     primary_photo_id INTEGER,
     favorite INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
@@ -89,7 +91,7 @@ RELATIONS = {
 ITEM_FIELDS = [
     "name", "description", "category_id", "location_id", "quantity", "unit",
     "min_quantity", "part_number", "manufacturer", "barcode", "value", "tags",
-    "notes", "url", "favorite",
+    "notes", "url", "favorite", "compatible_with",
 ]
 
 
@@ -104,6 +106,7 @@ class DB:
         self.write_lock = threading.Lock()
         conn = self.conn
         conn.executescript(SCHEMA)
+        self._migrate(conn)
         self.fts = self._init_fts(conn)
         conn.commit()
 
@@ -119,6 +122,32 @@ class DB:
             self._local.conn = c
         return c
 
+    def _migrate(self, conn):
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(categories)")}
+        if "parent_id" not in cols:
+            # v1 categories were flat with a UNIQUE name; rebuild as a tree
+            conn.execute("PRAGMA foreign_keys=OFF")
+            conn.executescript("""
+                BEGIN;
+                CREATE TABLE categories_new (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL COLLATE NOCASE,
+                    parent_id INTEGER REFERENCES categories(id) ON DELETE CASCADE,
+                    color TEXT DEFAULT '',
+                    created_at INTEGER NOT NULL);
+                INSERT INTO categories_new(id, name, color, created_at)
+                    SELECT id, name, color, created_at FROM categories;
+                DROP TABLE categories;
+                ALTER TABLE categories_new RENAME TO categories;
+                COMMIT;""")
+            conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_categories_parent ON categories(parent_id)")
+        icols = {r[1] for r in conn.execute("PRAGMA table_info(items)")}
+        if "compatible_with" not in icols:
+            conn.execute("ALTER TABLE items ADD COLUMN compatible_with TEXT DEFAULT ''")
+
+    CATEGORY_NAME_SQL = ("CASE WHEN pc.name IS NULL THEN c.name ELSE pc.name || ' › ' || c.name END")
+
     def _init_fts(self, conn):
         try:
             existed = conn.execute(
@@ -127,8 +156,8 @@ class DB:
                 "CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5("
                 "name, body, tokenize='unicode61 remove_diacritics 2', prefix='2 3')")
             ver = conn.execute("SELECT value FROM meta WHERE key='fts_ver'").fetchone()
-            if not existed or not ver or ver[0] != "2":
-                conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('fts_ver', '2')")
+            if not existed or not ver or ver[0] != "3":
+                conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('fts_ver', '3')")
                 ids = [r[0] for r in conn.execute("SELECT id FROM items")]
                 for i in ids:
                     self._reindex(conn, i, fts=True)
@@ -181,13 +210,15 @@ class DB:
             return
         conn.execute("DELETE FROM items_fts WHERE rowid=?", (item_id,))
         it = conn.execute("""
-            SELECT i.*, c.name AS category_name FROM items i
-            LEFT JOIN categories c ON c.id=i.category_id WHERE i.id=?""", (item_id,)).fetchone()
+            SELECT i.*, """ + self.CATEGORY_NAME_SQL + """ AS category_name FROM items i
+            LEFT JOIN categories c ON c.id=i.category_id
+            LEFT JOIN categories pc ON pc.id=c.parent_id WHERE i.id=?""", (item_id,)).fetchone()
         if not it:
             return
         body = " ".join(str(x or "") for x in [
             it["description"], it["part_number"], it["manufacturer"], it["barcode"],
             (it["tags"] or "").replace(",", " "), it["notes"], it["category_name"],
+            (it["compatible_with"] or "").replace(",", " "),
             self.location_path(it["location_id"]),
             # split part numbers like "LM7805-CT" into pieces too
             re.sub(r"[-_/.]", " ", it["part_number"] or ""),
@@ -208,10 +239,12 @@ class DB:
 
     def item_row_sql(self):
         return """
-            SELECT i.*, c.name AS category_name, c.color AS category_color,
+            SELECT i.*, """ + self.CATEGORY_NAME_SQL + """ AS category_name,
+              COALESCE(NULLIF(c.color, ''), pc.color) AS category_color,
               (SELECT filename FROM photos p WHERE p.id=i.primary_photo_id) AS photo,
               (SELECT COUNT(*) FROM photos p WHERE p.item_id=i.id) AS photo_count
-            FROM items i LEFT JOIN categories c ON c.id=i.category_id"""
+            FROM items i LEFT JOIN categories c ON c.id=i.category_id
+            LEFT JOIN categories pc ON pc.id=c.parent_id"""
 
     def decorate(self, rows):
         cache = {}
@@ -223,6 +256,7 @@ class DB:
             r["low"] = bool(r.get("min_quantity") is not None
                             and r["quantity"] <= r["min_quantity"])
             r["tags"] = [t.strip() for t in (r.get("tags") or "").split(",") if t.strip()]
+            r["compatible"] = [t.strip() for t in (r.get("compatible_with") or "").split(",") if t.strip()]
         return rows
 
     @staticmethod
@@ -259,15 +293,17 @@ class DB:
             else:
                 like = f"%{q}%"
                 where.append("(i.name LIKE ? OR i.description LIKE ? OR i.part_number LIKE ? "
-                             "OR i.tags LIKE ? OR i.notes LIKE ? OR i.manufacturer LIKE ? OR i.barcode LIKE ?)")
-                args += [like] * 7
+                             "OR i.tags LIKE ? OR i.notes LIKE ? OR i.manufacturer LIKE ? OR i.barcode LIKE ? "
+                             "OR i.compatible_with LIKE ?)")
+                args += [like] * 8
         if location_id:
             ids = self.location_descendants(int(location_id))
             where.append("i.location_id IN (%s)" % ",".join("?" * len(ids)))
             args += ids
         if category_id:
-            where.append("i.category_id=?")
-            args.append(int(category_id))
+            # a parent category includes all of its sub-categories
+            where.append("i.category_id IN (SELECT id FROM categories WHERE id=? OR parent_id=?)")
+            args += [int(category_id), int(category_id)]
         if low:
             where.append("i.min_quantity IS NOT NULL AND i.quantity <= i.min_quantity")
         if favorite:
@@ -334,7 +370,7 @@ class DB:
                 v = None if v in (None, "", 0, "0") else int(v)
             elif f == "favorite":
                 v = 1 if v else 0
-            elif f == "tags":
+            elif f in ("tags", "compatible_with"):
                 if isinstance(v, list):
                     v = ",".join(t.strip() for t in v if str(t).strip())
                 v = ",".join(dict.fromkeys(t.strip() for t in str(v or "").split(",") if t.strip()))
