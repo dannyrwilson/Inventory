@@ -1,0 +1,678 @@
+"""Parts Inventory — Home Assistant add-on web server."""
+import csv
+import hashlib
+import hmac
+import io
+import json
+import logging
+import os
+import secrets
+import sys
+import time
+import uuid
+
+from flask import Flask, Response, abort, jsonify, request, send_from_directory
+from PIL import Image, ImageOps
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from db import DB, RELATIONS, ITEM_FIELDS, now  # noqa: E402
+import ai  # noqa: E402
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("inventory")
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.environ.get("DATA_DIR", os.path.join(BASE, "..", "..", "devdata"))
+PHOTO_DIR = os.path.join(DATA_DIR, "photos")
+THUMB_DIR = os.path.join(DATA_DIR, "thumbs")
+for d in (DATA_DIR, PHOTO_DIR, THUMB_DIR):
+    os.makedirs(d, exist_ok=True)
+
+
+def load_options():
+    opts = {}
+    p = os.path.join(DATA_DIR, "options.json")
+    if os.path.exists(p):
+        try:
+            with open(p) as f:
+                opts = json.load(f)
+        except Exception as e:  # pragma: no cover
+            log.warning("Could not read options.json: %s", e)
+    opts.setdefault("anthropic_api_key", os.environ.get("ANTHROPIC_API_KEY", ""))
+    opts.setdefault("ai_model", os.environ.get("AI_MODEL", "claude-opus-5-5"))
+    opts.setdefault("password", os.environ.get("INVENTORY_PASSWORD", ""))
+    return opts
+
+
+OPTS = load_options()
+db = DB(os.path.join(DATA_DIR, "inventory.db"))
+identifier = ai.Identifier(OPTS.get("anthropic_api_key"), OPTS.get("ai_model"))
+
+secret_path = os.path.join(DATA_DIR, ".secret")
+if not os.path.exists(secret_path):
+    with open(secret_path, "w") as f:
+        f.write(secrets.token_hex(32))
+with open(secret_path) as f:
+    SECRET = f.read().strip()
+
+app = Flask(__name__, static_folder=None)
+app.config["MAX_CONTENT_LENGTH"] = 80 * 1024 * 1024
+STATIC = os.path.join(BASE, "static")
+INGRESS_IP = "172.30.32.2"
+
+
+# ------------------------------------------------------------------ helpers
+def err(msg, code=400):
+    return jsonify({"error": msg}), code
+
+
+def body():
+    return request.get_json(silent=True) or {}
+
+
+def auth_token():
+    pw = OPTS.get("password") or ""
+    return hmac.new(SECRET.encode(), pw.encode(), hashlib.sha256).hexdigest()
+
+
+@app.before_request
+def check_auth():
+    if not OPTS.get("password"):
+        return None
+    if request.remote_addr == INGRESS_IP:
+        return None  # Home Assistant ingress already authenticated the user
+    if request.path in ("/login", "/manifest.webmanifest") or request.path.startswith("/icons/"):
+        return None
+    if hmac.compare_digest(request.cookies.get("inv_auth", ""), auth_token()):
+        return None
+    if request.path.startswith("/api/"):
+        return err("Unauthorized", 401)
+    return send_from_directory(STATIC, "login.html")
+
+
+@app.post("/login")
+def login():
+    pw = request.form.get("password", "") or body().get("password", "")
+    if not hmac.compare_digest(pw, OPTS.get("password") or ""):
+        time.sleep(1)
+        return Response("", 302, {"Location": "./?bad=1"})
+    resp = Response("", 302, {"Location": "./"})
+    resp.set_cookie("inv_auth", auth_token(), max_age=60 * 60 * 24 * 365, httponly=True, samesite="Lax")
+    return resp
+
+
+def save_image(file_storage):
+    """Normalize an uploaded image (orientation, size) and make a thumbnail."""
+    im = Image.open(file_storage.stream)
+    im = ImageOps.exif_transpose(im)
+    if im.mode not in ("RGB", "L"):
+        bg = Image.new("RGB", im.size, (255, 255, 255))
+        try:
+            bg.paste(im, mask=im.convert("RGBA").split()[-1])
+        except Exception:
+            bg.paste(im.convert("RGB"))
+        im = bg
+    im.thumbnail((2400, 2400))
+    name = uuid.uuid4().hex + ".jpg"
+    im.save(os.path.join(PHOTO_DIR, name), "JPEG", quality=86, optimize=True)
+    th = im.copy()
+    th.thumbnail((480, 480))
+    th.save(os.path.join(THUMB_DIR, name), "JPEG", quality=80, optimize=True)
+    return name, im.width, im.height
+
+
+def store_uploads(item_id=None, location_id=None):
+    files = request.files.getlist("photo") or request.files.getlist("photos")
+    if not files:
+        abort(400, "No photo uploaded")
+    out = []
+    for f in files:
+        try:
+            name, w, h = save_image(f)
+        except Exception as e:
+            log.warning("Bad image upload: %s", e)
+            continue
+        with db.tx() as c:
+            cur = c.execute("INSERT INTO photos(item_id, location_id, filename, width, height, created_at) "
+                            "VALUES (?,?,?,?,?,?)", (item_id, location_id, name, w, h, now()))
+            out.append({"id": cur.lastrowid, "filename": name})
+    if not out:
+        abort(400, "Could not read image")
+    return out
+
+
+def remove_files(names):
+    for n in names:
+        for d in (PHOTO_DIR, THUMB_DIR):
+            try:
+                os.remove(os.path.join(d, n))
+            except FileNotFoundError:
+                pass
+
+
+def cleanup_orphans():
+    cutoff = now() - 86400
+    rows = db.q("SELECT id, filename FROM photos WHERE item_id IS NULL AND location_id IS NULL "
+                "AND created_at<?", (cutoff,))
+    if rows:
+        with db.tx() as c:
+            c.executemany("DELETE FROM photos WHERE id=?", [(r["id"],) for r in rows])
+        remove_files(r["filename"] for r in rows)
+        log.info("Removed %d orphan uploads", len(rows))
+
+
+def get_or_create_category(name):
+    name = (name or "").strip()
+    if not name:
+        return None
+    r = db.one("SELECT id FROM categories WHERE name=? COLLATE NOCASE", (name,))
+    if r:
+        return r["id"]
+    with db.tx() as c:
+        return c.execute("INSERT INTO categories(name, created_at) VALUES (?,?)", (name, now())).lastrowid
+
+
+def get_or_create_location_path(path):
+    parts = [p.strip() for p in str(path or "").replace("›", ">").replace("/", ">").split(">") if p.strip()]
+    parent = None
+    for p in parts:
+        r = db.one("SELECT id FROM locations WHERE name=? COLLATE NOCASE AND parent_id IS ?", (p, parent))
+        if r:
+            parent = r["id"]
+        else:
+            with db.tx() as c:
+                parent = c.execute("INSERT INTO locations(name, parent_id, created_at) VALUES (?,?,?)",
+                                   (p, parent, now())).lastrowid
+    return parent
+
+
+# ------------------------------------------------------------------ static
+@app.get("/")
+def index():
+    resp = send_from_directory(STATIC, "index.html")
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
+@app.get("/static/<path:p>")
+def static_files(p):
+    resp = send_from_directory(STATIC, p)
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
+@app.get("/sw.js")
+def sw():
+    resp = send_from_directory(STATIC, "sw.js")
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
+@app.get("/manifest.webmanifest")
+def manifest():
+    return send_from_directory(STATIC, "manifest.webmanifest", mimetype="application/manifest+json")
+
+
+@app.get("/icons/<path:p>")
+def icons(p):
+    return send_from_directory(os.path.join(STATIC, "icons"), p, max_age=86400 * 30)
+
+
+@app.get("/photos/<name>")
+def photo(name):
+    return send_from_directory(PHOTO_DIR, name, max_age=86400 * 365)
+
+
+@app.get("/thumbs/<name>")
+def thumb(name):
+    return send_from_directory(THUMB_DIR, name, max_age=86400 * 365)
+
+
+# --------------------------------------------------------------------- api
+@app.get("/api/config")
+def config():
+    return jsonify({
+        "ai_enabled": identifier.enabled,
+        "ai_model": identifier.model if identifier.enabled else None,
+        "relations": [{"key": k, "label": v[0], "inverse": v[1]} for k, v in RELATIONS.items()],
+        "fts": db.fts,
+    })
+
+
+@app.get("/api/stats")
+def stats():
+    s = db.stats()
+    s["recent"] = db.decorate(db.q(db.item_row_sql() + " ORDER BY i.updated_at DESC LIMIT 12"))
+    s["low_items"] = db.decorate(db.q(db.item_row_sql() + " WHERE i.min_quantity IS NOT NULL AND "
+                                      "i.quantity<=i.min_quantity ORDER BY i.quantity ASC LIMIT 12"))
+    return jsonify(s)
+
+
+@app.get("/api/items")
+def list_items():
+    a = request.args
+    rows, total = db.search_items(
+        q=a.get("q", ""), location_id=a.get("location"), category_id=a.get("category"),
+        low=a.get("low") == "1", favorite=a.get("favorite") == "1", sort=a.get("sort", "updated"),
+        limit=min(int(a.get("limit", 60)), 500), offset=int(a.get("offset", 0)))
+    return jsonify({"items": rows, "total": total})
+
+
+@app.post("/api/items")
+def create_item():
+    data = body()
+    try:
+        if data.get("category_name") and not data.get("category_id"):
+            data["category_id"] = get_or_create_category(data["category_name"])
+        item_id = db.create_item(data, data.get("photo_ids") or [])
+    except ValueError as e:
+        return err(str(e))
+    return jsonify(db.get_item(item_id)), 201
+
+
+@app.get("/api/items/<int:item_id>")
+def get_item(item_id):
+    it = db.get_item(item_id)
+    return jsonify(it) if it else err("Not found", 404)
+
+
+@app.put("/api/items/<int:item_id>")
+@app.patch("/api/items/<int:item_id>")
+def update_item(item_id):
+    data = body()
+    try:
+        if data.get("category_name") and not data.get("category_id"):
+            data["category_id"] = get_or_create_category(data["category_name"])
+        if not db.update_item(item_id, data):
+            return err("Not found", 404)
+    except ValueError as e:
+        return err(str(e))
+    if data.get("photo_ids"):
+        db.attach_photos(item_id, data["photo_ids"])
+    return jsonify(db.get_item(item_id))
+
+
+@app.delete("/api/items/<int:item_id>")
+def delete_item(item_id):
+    remove_files(db.delete_item(item_id))
+    return jsonify({"ok": True})
+
+
+@app.post("/api/items/<int:item_id>/duplicate")
+def duplicate_item(item_id):
+    new_id = db.duplicate_item(item_id)
+    return jsonify(db.get_item(new_id)) if new_id else err("Not found", 404)
+
+
+@app.post("/api/items/<int:item_id>/adjust")
+def adjust(item_id):
+    d = body()
+    try:
+        delta = float(d.get("delta", 0))
+    except (TypeError, ValueError):
+        return err("Invalid amount")
+    if "set" in d:
+        cur = db.one("SELECT quantity FROM items WHERE id=?", (item_id,))
+        if not cur:
+            return err("Not found", 404)
+        delta = float(d["set"]) - cur["quantity"]
+    q = db.adjust(item_id, delta, d.get("reason", ""))
+    if q is None:
+        return err("Not found", 404)
+    db.reindex(item_id)
+    return jsonify({"quantity": q, "item": db.get_item(item_id)})
+
+
+@app.post("/api/items/<int:item_id>/photos")
+def add_photos(item_id):
+    if not db.one("SELECT id FROM items WHERE id=?", (item_id,)):
+        return err("Not found", 404)
+    out = store_uploads(item_id=item_id)
+    db.attach_photos(item_id, [p["id"] for p in out])
+    return jsonify(db.get_item(item_id))
+
+
+@app.post("/api/uploads")
+def uploads():
+    """Upload photos not yet attached to anything (used by photo-first create)."""
+    return jsonify({"photos": store_uploads()})
+
+
+@app.delete("/api/photos/<int:photo_id>")
+def delete_photo(photo_id):
+    p = db.one("SELECT * FROM photos WHERE id=?", (photo_id,))
+    if not p:
+        return err("Not found", 404)
+    with db.tx() as c:
+        c.execute("DELETE FROM photos WHERE id=?", (photo_id,))
+        if p["item_id"]:
+            c.execute("""UPDATE items SET primary_photo_id=(SELECT id FROM photos WHERE item_id=?
+                         ORDER BY id LIMIT 1) WHERE id=? AND primary_photo_id=?""",
+                      (p["item_id"], p["item_id"], photo_id))
+    remove_files([p["filename"]])
+    return jsonify({"ok": True})
+
+
+@app.post("/api/photos/<int:photo_id>/primary")
+def primary_photo(photo_id):
+    p = db.one("SELECT * FROM photos WHERE id=?", (photo_id,))
+    if not p or not p["item_id"]:
+        return err("Not found", 404)
+    with db.tx() as c:
+        c.execute("UPDATE items SET primary_photo_id=?, updated_at=? WHERE id=?", (photo_id, now(), p["item_id"]))
+    return jsonify(db.get_item(p["item_id"]))
+
+
+# links
+@app.post("/api/items/<int:item_id>/links")
+def add_link(item_id):
+    d = body()
+    target = int(d.get("target_id") or 0)
+    rel = d.get("relation") or "related"
+    if rel not in RELATIONS:
+        return err("Unknown relation")
+    if not target or target == item_id:
+        return err("Pick a different item")
+    if not db.one("SELECT id FROM items WHERE id=?", (target,)):
+        return err("Target not found", 404)
+    a, b = item_id, target
+    if d.get("inverse"):
+        a, b = b, a
+    try:
+        with db.tx() as c:
+            c.execute("INSERT INTO links(item_a, item_b, relation, note, created_at) VALUES (?,?,?,?,?)",
+                      (a, b, rel, d.get("note", ""), now()))
+    except Exception:
+        return err("Already linked")
+    return jsonify(db.get_item(item_id))
+
+
+@app.delete("/api/links/<int:link_id>")
+def delete_link(link_id):
+    with db.tx() as c:
+        c.execute("DELETE FROM links WHERE id=?", (link_id,))
+    return jsonify({"ok": True})
+
+
+# locations
+@app.get("/api/locations")
+def list_locations():
+    return jsonify(db.list_locations())
+
+
+@app.get("/api/locations/<int:loc_id>")
+def get_location(loc_id):
+    loc = db.one("SELECT * FROM locations WHERE id=?", (loc_id,))
+    if not loc:
+        return err("Not found", 404)
+    loc["path"] = db.location_path(loc_id)
+    loc["children"] = db.q("SELECT l.*, (SELECT COUNT(*) FROM items i WHERE i.location_id=l.id) AS item_count "
+                           "FROM locations l WHERE parent_id=? ORDER BY name COLLATE NOCASE", (loc_id,))
+    loc["photos"] = db.q("SELECT id, filename FROM photos WHERE location_id=? ORDER BY id DESC", (loc_id,))
+    return jsonify(loc)
+
+
+@app.post("/api/locations")
+def create_location():
+    d = body()
+    name = (d.get("name") or "").strip()
+    if not name:
+        return err("Name is required")
+    with db.tx() as c:
+        lid = c.execute("INSERT INTO locations(name, parent_id, description, created_at) VALUES (?,?,?,?)",
+                        (name, d.get("parent_id") or None, d.get("description", ""), now())).lastrowid
+    return jsonify(db.one("SELECT * FROM locations WHERE id=?", (lid,))), 201
+
+
+@app.put("/api/locations/<int:loc_id>")
+def update_location(loc_id):
+    d = body()
+    name = (d.get("name") or "").strip()
+    if not name:
+        return err("Name is required")
+    parent = d.get("parent_id") or None
+    if parent and int(parent) in db.location_descendants(loc_id):
+        return err("A location can't be inside itself")
+    with db.tx() as c:
+        c.execute("UPDATE locations SET name=?, parent_id=?, description=? WHERE id=?",
+                  (name, parent, d.get("description", ""), loc_id))
+    ids = [r["id"] for r in db.q("SELECT id FROM items WHERE location_id IN (%s)" %
+                                 ",".join(str(i) for i in db.location_descendants(loc_id)))]
+    db.reindex_many(ids)
+    return jsonify(db.one("SELECT * FROM locations WHERE id=?", (loc_id,)))
+
+
+@app.delete("/api/locations/<int:loc_id>")
+def delete_location(loc_id):
+    loc = db.one("SELECT * FROM locations WHERE id=?", (loc_id,))
+    if not loc:
+        return err("Not found", 404)
+    files = [r["filename"] for r in db.q("SELECT filename FROM photos WHERE location_id=?", (loc_id,))]
+    with db.tx() as c:
+        # children and items move up to the parent location
+        c.execute("UPDATE locations SET parent_id=? WHERE parent_id=?", (loc["parent_id"], loc_id))
+        ids = [r[0] for r in c.execute("SELECT id FROM items WHERE location_id=?", (loc_id,))]
+        c.execute("UPDATE items SET location_id=? WHERE location_id=?", (loc["parent_id"], loc_id))
+        c.execute("DELETE FROM locations WHERE id=?", (loc_id,))
+    db.reindex_many(ids)
+    remove_files(files)
+    return jsonify({"ok": True})
+
+
+@app.post("/api/locations/<int:loc_id>/photos")
+def location_photo(loc_id):
+    if not db.one("SELECT id FROM locations WHERE id=?", (loc_id,)):
+        return err("Not found", 404)
+    store_uploads(location_id=loc_id)
+    return get_location(loc_id)
+
+
+# categories
+@app.get("/api/categories")
+def list_categories():
+    return jsonify(db.q("SELECT c.*, (SELECT COUNT(*) FROM items i WHERE i.category_id=c.id) AS item_count "
+                        "FROM categories c ORDER BY name COLLATE NOCASE"))
+
+
+@app.post("/api/categories")
+def create_category():
+    d = body()
+    name = (d.get("name") or "").strip()
+    if not name:
+        return err("Name is required")
+    cid = get_or_create_category(name)
+    if d.get("color"):
+        with db.tx() as c:
+            c.execute("UPDATE categories SET color=? WHERE id=?", (d["color"], cid))
+    return jsonify(db.one("SELECT * FROM categories WHERE id=?", (cid,))), 201
+
+
+@app.put("/api/categories/<int:cid>")
+def update_category(cid):
+    d = body()
+    name = (d.get("name") or "").strip()
+    if not name:
+        return err("Name is required")
+    try:
+        with db.tx() as c:
+            c.execute("UPDATE categories SET name=?, color=? WHERE id=?", (name, d.get("color", ""), cid))
+    except Exception:
+        return err("A category with that name exists")
+    db.reindex_many([r["id"] for r in db.q("SELECT id FROM items WHERE category_id=?", (cid,))])
+    return jsonify(db.one("SELECT * FROM categories WHERE id=?", (cid,)))
+
+
+@app.delete("/api/categories/<int:cid>")
+def delete_category(cid):
+    ids = [r["id"] for r in db.q("SELECT id FROM items WHERE category_id=?", (cid,))]
+    with db.tx() as c:
+        c.execute("DELETE FROM categories WHERE id=?", (cid,))
+    db.reindex_many(ids)
+    return jsonify({"ok": True})
+
+
+@app.get("/api/activity")
+def activity():
+    return jsonify(db.activity(int(request.args.get("limit", 80))))
+
+
+@app.get("/api/lookup")
+def lookup():
+    """Resolve a scanned code: INV:<id>, LOC:<id>, or a barcode/part number."""
+    code = (request.args.get("code") or "").strip()
+    up = code.upper()
+    if up.startswith("INV:") and up[4:].isdigit():
+        if db.one("SELECT id FROM items WHERE id=?", (int(up[4:]),)):
+            return jsonify({"type": "item", "id": int(up[4:])})
+    if up.startswith("LOC:") and up[4:].isdigit():
+        if db.one("SELECT id FROM locations WHERE id=?", (int(up[4:]),)):
+            return jsonify({"type": "location", "id": int(up[4:])})
+    rows = db.q("SELECT id FROM items WHERE (barcode=? AND barcode!='') OR "
+                "(part_number=? COLLATE NOCASE AND part_number!='')", (code, code))
+    if len(rows) == 1:
+        return jsonify({"type": "item", "id": rows[0]["id"]})
+    return jsonify({"type": "none", "code": code, "matches": [r["id"] for r in rows]})
+
+
+# QR codes
+@app.get("/api/qr")
+def qr():
+    import segno
+    data = request.args.get("data", "")[:300]
+    if not data:
+        return err("No data")
+    buf = io.BytesIO()
+    segno.make(data, error="m").save(buf, kind="svg", scale=8, border=2, xmldecl=False)
+    return Response(buf.getvalue(), mimetype="image/svg+xml",
+                    headers={"Cache-Control": "max-age=86400"})
+
+
+# AI
+@app.post("/api/ai/identify")
+def ai_identify():
+    """Identify item(s) in photos. Accepts new uploads and/or existing photo_ids."""
+    photo_rows = []
+    if request.files:
+        photo_rows = store_uploads()
+    ids = request.form.get("photo_ids", "")
+    for pid in [p for p in ids.split(",") if p.strip().isdigit()]:
+        r = db.one("SELECT id, filename FROM photos WHERE id=?", (int(pid),))
+        if r:
+            photo_rows.append(r)
+    if not photo_rows:
+        return err("No photo")
+    result = {"photos": photo_rows, "suggestion": None, "matches": []}
+    if not identifier.enabled:
+        result["error"] = "AI is not configured. Add an Anthropic API key in the add-on configuration."
+        return jsonify(result)
+    cats = [c["name"] for c in db.q("SELECT name FROM categories ORDER BY name")]
+    try:
+        sug = identifier.identify([os.path.join(PHOTO_DIR, p["filename"]) for p in photo_rows],
+                                  cats, request.form.get("hint", ""))
+    except Exception as e:
+        log.exception("AI identify failed")
+        result["error"] = ai.friendly_error(e)
+        return jsonify(result)
+    result["suggestion"] = sug
+    # find existing items that might be the same thing
+    seen, matches = set(), []
+    queries = [sug.get("part_number"), sug.get("barcode"), sug.get("name"),
+               " ".join(sug.get("search_keywords") or [])]
+    for qtext in [q for q in queries if q]:
+        rows, _ = db.search_items(q=qtext, limit=6, sort="relevance", any_terms=(qtext != sug.get("part_number")))
+        for r in rows:
+            if r["id"] not in seen:
+                seen.add(r["id"])
+                matches.append(r)
+    result["matches"] = matches[:8]
+    return jsonify(result)
+
+
+# import / export
+EXPORT_COLS = ["id", "name", "description", "category", "location", "quantity", "unit", "min_quantity",
+               "part_number", "manufacturer", "barcode", "value", "tags", "notes", "url", "favorite"]
+
+
+@app.get("/api/export.csv")
+def export_csv():
+    rows, _ = db.search_items(limit=10 ** 9, sort="name")
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(EXPORT_COLS)
+    for r in rows:
+        w.writerow([r["id"], r["name"], r["description"], r.get("category_name") or "",
+                    (r.get("location_path") or "").replace(" › ", " > "), r["quantity"], r["unit"],
+                    "" if r["min_quantity"] is None else r["min_quantity"], r["part_number"],
+                    r["manufacturer"], r["barcode"], "" if r["value"] is None else r["value"],
+                    ",".join(r["tags"]), r["notes"], r["url"], r["favorite"]])
+    return Response(buf.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=inventory.csv"})
+
+
+@app.get("/api/export.json")
+def export_json():
+    out = {
+        "exported_at": now(),
+        "locations": db.q("SELECT * FROM locations"),
+        "categories": db.q("SELECT * FROM categories"),
+        "items": db.q("SELECT * FROM items"),
+        "photos": db.q("SELECT * FROM photos"),
+        "links": db.q("SELECT * FROM links"),
+        "stock_log": db.q("SELECT * FROM stock_log"),
+    }
+    return Response(json.dumps(out, indent=1), mimetype="application/json",
+                    headers={"Content-Disposition": "attachment; filename=inventory.json"})
+
+
+@app.post("/api/import.csv")
+def import_csv():
+    f = request.files.get("file")
+    if not f:
+        return err("No file")
+    text = f.read().decode("utf-8-sig", errors="replace")
+    reader = csv.DictReader(io.StringIO(text))
+    created = updated = 0
+    errors = []
+    for n, row in enumerate(reader, start=2):
+        row = {(k or "").strip().lower(): (v or "").strip() for k, v in row.items()}
+        try:
+            data = {k: row[k] for k in ITEM_FIELDS if k in row and row[k] != ""}
+            if row.get("category"):
+                data["category_id"] = get_or_create_category(row["category"])
+            if row.get("location"):
+                data["location_id"] = get_or_create_location_path(row["location"])
+            if "favorite" in data:
+                data["favorite"] = data["favorite"] not in ("0", "false", "no")
+            rid = row.get("id")
+            if rid and rid.isdigit() and db.one("SELECT id FROM items WHERE id=?", (int(rid),)):
+                db.update_item(int(rid), data)
+                updated += 1
+            else:
+                db.create_item(data, reason="Imported")
+                created += 1
+        except Exception as e:
+            errors.append(f"Row {n}: {e}")
+    return jsonify({"created": created, "updated": updated, "errors": errors[:50]})
+
+
+@app.errorhandler(400)
+def bad_request(e):
+    return err(getattr(e, "description", "Bad request"), 400)
+
+
+@app.errorhandler(413)
+def too_large(e):
+    return err("Upload too large", 413)
+
+
+def main():
+    cleanup_orphans()
+    port = int(os.environ.get("PORT", 8099))
+    log.info("Parts Inventory on port %d (data: %s, AI: %s, FTS: %s)", port, DATA_DIR,
+             "on" if identifier.enabled else "off", db.fts)
+    from waitress import serve
+    serve(app, host="0.0.0.0", port=port, threads=8, max_request_body_size=80 * 1024 * 1024)
+
+
+if __name__ == "__main__":
+    main()

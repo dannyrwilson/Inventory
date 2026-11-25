@@ -1,0 +1,5 @@
+flask>=3.0,<4
+waitress>=3.0,<4
+pillow>=10
+anthropic>=2.14,<3
+segno>=1.6,<2
