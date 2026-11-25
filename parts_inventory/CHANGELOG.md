@@ -1,3 +1,7 @@
+## 1.5.0
+- Scan multiple photos at once: pick many photos (one part each), AI identifies them in parallel,
+  review the list and add them all (stock 1 each, existing items get +1 instead of duplicates).
+
 ## 1.4.0
 - Duplicate protection: adding an item you already have offers to add stock to it instead.
   Box scans and CSV imports stock existing items rather than creating copies.

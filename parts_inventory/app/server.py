@@ -758,11 +758,13 @@ def ai_identify():
         return jsonify(result)
     result["suggestion"] = sug
     # find existing items that might be the same thing
+    hidden = dup.hidden_ids()
     seen, matches = set(), []
     queries = [sug.get("part_number"), sug.get("barcode"), sug.get("name"),
                " ".join(sug.get("search_keywords") or [])]
     for qtext in [q for q in queries if q]:
-        rows, _ = db.search_items(q=qtext, limit=6, sort="relevance", any_terms=(qtext != sug.get("part_number")))
+        rows, _ = db.search_items(q=qtext, limit=6, sort="relevance", any_terms=(qtext != sug.get("part_number")),
+                                  exclude=hidden)
         for r in rows:
             if r["id"] not in seen:
                 seen.add(r["id"])
@@ -781,7 +783,7 @@ def _strong_match(entry):
     for text in (entry.get("label_text"), entry.get("name")):
         if not text or text.strip() == "?":
             continue
-        rows, _ = db.search_items(q=text, limit=1, sort="relevance")
+        rows, _ = db.search_items(q=text, limit=1, sort="relevance", exclude=dup.hidden_ids())
         if rows:
             return rows[0]["id"]
     return None
@@ -867,7 +869,7 @@ def create_items_batch():
         data["location_id"] = location_id
         if e.get("category"):
             data["category_id"] = get_or_create_category(e["category"])
-        item_id = db.create_item(data, reason="Box scan")
+        item_id = db.create_item(data, e.get("photo_ids") or [], reason="Box scan")
         if photo_ids:
             # share the box photo: attach a reference copy to each item
             with db.tx() as c:

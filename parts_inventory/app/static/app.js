@@ -375,6 +375,7 @@ route(/^\/$/, async (view) => {
     ${s.items ? `<div class="section-h"><span>Quick actions</span></div>
     <div class="group">
       <button class="row" id="qa-snap"><span class="ico">${I.camera}</span><div class="main">Snap &amp; identify</div>${I.chev}</button>
+      ${cfg.ai_enabled ? `<button class="row" id="qa-multi"><span class="ico" style="background:#ff2d55">${I.image}</span><div class="main">Scan multiple photos at once</div>${I.chev}</button>` : ""}
       ${cfg.ai_enabled ? `<button class="row" id="qa-box"><span class="ico" style="background:#00c7be">${I.grid}</span><div class="main">Scan a whole picking box</div>${I.chev}</button>` : ""}
       <button class="row" id="qa-scan"><span class="ico" style="background:#5856d6">${I.qr}</span><div class="main">Scan a label or barcode</div>${I.chev}</button>
       <button class="row" id="qa-new"><span class="ico" style="background:#34c759">${I.plus}</span><div class="main">New item</div>${I.chev}</button>
@@ -388,6 +389,7 @@ route(/^\/$/, async (view) => {
   q("#qa-snap", () => snap("camera"));
   q("#qa-scan", () => scanFlow());
   q("#qa-box", () => boxScan());
+  q("#qa-multi", () => multiScan());
   q("#qa-new", () => itemForm());
 }, "home");
 
@@ -922,11 +924,13 @@ longPress(document.getElementById("snapbtn"), async () => {
   const v = await actionSheet([
     { label: "Take Photo", value: "camera", icon: I.camera },
     { label: "Photo Library", value: "library", icon: I.image },
+    { label: "Scan Multiple Photos", value: "multi", icon: I.image },
     { label: "Scan Whole Box (many labels)", value: "box", icon: I.grid },
     { label: "Scan Label / Barcode", value: "scan", icon: I.qr },
     { label: "New Item (no photo)", value: "new", icon: I.plus },
   ]);
-  if (v === "box") boxScan();
+  if (v === "multi") multiScan();
+  else if (v === "box") boxScan();
   else if (v === "scan") scanFlow();
   else if (v === "new") itemForm();
   else if (v) snap(v);
@@ -936,6 +940,14 @@ async function snap(source) {
   const files = await pickFiles(source);
   if (!files.length) return;
   const cfg = await config();
+  if (files.length > 1 && cfg.ai_enabled) {
+    const v = await actionSheet([
+      { label: `${files.length} different parts`, value: "multi" },
+      { label: "One part, several angles", value: "one" },
+    ], `You picked ${files.length} photos`);
+    if (!v) return;
+    if (v === "multi") return multiScan(files);
+  }
   const shrunk = await Promise.all(files.map((f) => shrink(f)));
   const previewURL = URL.createObjectURL(shrunk[0].blob);
   const s = openSheet({
@@ -1158,6 +1170,111 @@ async function boxScan(presetLocation, existingPhotos, existingPreview) {
     };
   };
   draw();
+}
+
+// ------------------------------------------------------------------ multi-photo scan
+// Pick many photos at once (one part per photo); AI identifies each, then review & add all.
+async function multiScan(files) {
+  const cfg = await config();
+  if (!cfg.ai_enabled) { toast("Multi-photo scan needs AI — add an OpenAI key in the add-on configuration"); return; }
+  files = files || await pickFiles("library");
+  if (!files.length) return;
+  const rows = [];
+  let presetLocation = "";
+  const s = openSheet({
+    title: "Scan Photos", full: true,
+    left: { label: "Cancel", fn: () => s.close() },
+    body: `<div class="subtitle" id="mprog" style="margin:10px 16px"></div><div id="mout"></div>`,
+    onClose: () => rows.forEach((r) => URL.revokeObjectURL(r.preview)),
+  });
+  const locs = await locations();
+  const modeLabel = { new: "New", add: "+1 existing", skip: "Skip" };
+  const draw = () => {
+    const done = rows.filter((r) => r.state !== "busy").length;
+    const n = rows.filter((r) => r.state === "ok" && r.mode !== "skip").length;
+    $("#mprog", s.el).innerHTML = done < rows.length ? `<span class="spinner" style="width:16px;height:16px"></span> Identifying ${done + 1} of ${rows.length}…` : `${rows.length} photo${rows.length === 1 ? "" : "s"} identified. Each new item gets stock 1.`;
+    $("#mout", s.el).innerHTML = `
+      <div class="form"><div class="group"><div class="field"><label>Put in</label><select id="mloc">${locationOptions(locs, presetLocation)}</select></div></div></div>
+      <div class="group" style="margin-top:12px">${rows.map((r, i) => `
+        <div class="row thumb brow ${r.mode === "skip" || r.state !== "ok" ? "off" : ""}">
+          ${r.state === "ok" ? `<button class="check ${r.mode === "skip" ? "" : "on"}" data-check="${i}">✓</button>` : `<span style="width:26px"></span>`}
+          <img class="pic" src="${r.preview}">
+          <div class="main">
+            ${r.state === "busy" ? `<div class="t"><span class="spinner" style="width:16px;height:16px"></span> Identifying…</div>`
+              : r.state === "err" ? `<div class="t" style="color:var(--red)">${esc(r.error)}</div>`
+              : `<input class="bname" data-name="${i}" value="${esc(r.name)}">
+                 <div class="s">${esc([r.category, r.compat && r.compat.length ? "works with " + r.compat.slice(0, 3).join(", ") : ""].filter(Boolean).join(" · "))}</div>
+                 ${r.match ? `<div class="s" style="color:var(--orange)">Already have: ${esc(r.match.name)} (${fmt(r.match.quantity)})</div>` : ""}`}
+          </div>
+          ${r.state === "ok" ? `<button class="pill ${r.mode}" data-mode="${i}">${modeLabel[r.mode]}</button>` : ""}
+        </div>`).join("")}
+        <button class="row center" id="madd">${I.plus} Add more photos</button></div>
+      <div style="height:90px"></div>
+      <div class="sticky-cta"><button class="btn block" id="mgo" ${n && done === rows.length ? "" : "disabled"}>${I.plus} Add ${n} item${n === 1 ? "" : "s"}</button></div>`;
+    $("#mloc", s.el).onchange = async (e) => {
+      if (e.target.value === "__new") { presetLocation = (await newLocationPrompt()) || ""; locs.splice(0, locs.length, ...(await locations(true))); draw(); }
+      else presetLocation = e.target.value;
+    };
+    $$("[data-name]", s.el).forEach((inp) => (inp.oninput = () => (rows[+inp.dataset.name].name = inp.value)));
+    $$("[data-check]", s.el).forEach((b) => (b.onclick = () => { const r = rows[+b.dataset.check]; r.mode = r.mode === "skip" ? "new" : "skip"; haptic(); draw(); }));
+    $$("[data-mode]", s.el).forEach((b) => (b.onclick = async () => {
+      const r = rows[+b.dataset.mode];
+      const opts = [{ label: "Add as new item", value: "new" }];
+      if (r.match) opts.push({ label: `+1 to “${r.match.name.slice(0, 30)}”`, value: "add" });
+      opts.push({ label: "Skip", value: "skip" });
+      const v = await actionSheet(opts, r.name); if (v) { r.mode = v; draw(); }
+    }));
+    $("#madd", s.el).onclick = async () => { const more = await choosePhotos(); if (more.length) queue(more); };
+    $("#mgo", s.el).onclick = async () => {
+      const chosen = rows.filter((r) => r.state === "ok" && r.mode !== "skip" && r.name.trim());
+      const btn = $("#mgo", s.el); btn.disabled = true; btn.innerHTML = `<span class="spinner"></span> Adding…`;
+      try {
+        const r = await POST("api/items/batch", {
+          location_id: presetLocation || null,
+          items: chosen.map((c) => c.mode === "add" ? { add_to_id: c.match.id, quantity: 1 } : {
+            name: c.name.trim(), description: c.sug.description, category: c.sug.category, part_number: c.sug.part_number,
+            manufacturer: c.sug.manufacturer, tags: c.sug.tags, compatible_with: c.sug.compatible_with, quantity: 1,
+            photo_ids: c.photos.map((p) => p.id) }),
+        });
+        invalidate(); haptic(20); s.close();
+        toast([r.created.length ? `Added ${r.created.length}` : "", r.stocked.length ? `stocked ${r.stocked.length} existing` : ""].filter(Boolean).join(", ") || "Done");
+        location.hash = presetLocation ? `#/location/${presetLocation}` : "#/items";
+        refresh();
+      } catch (e) { fail(e); btn.disabled = false; btn.innerHTML = `${I.plus} Retry`; }
+    };
+  };
+  // identify up to 3 photos at a time
+  let active = 0;
+  const pending = [];
+  const pump = () => {
+    while (active < 3 && pending.length) {
+      const r = pending.shift(); active++;
+      (async () => {
+        try {
+          const { blob } = await shrink(r.file);
+          const res = await POST("api/ai/identify", formWithPhotos([blob]));
+          r.photos = res.photos;
+          if (res.error || !res.suggestion) { r.state = "err"; r.error = res.error || "Couldn't identify"; }
+          else {
+            r.sug = res.suggestion; r.name = res.suggestion.name; r.category = res.suggestion.category;
+            r.compat = res.suggestion.compatible_with || [];
+            const norm = (x) => x.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().split(" ").map((t) => t.length > 3 && /[^s]s$/.test(t) ? t.slice(0, -1) : t).sort().join(" ");
+            // only a real match (same name, or same part number) counts as "already have"
+            r.match = (res.matches || []).find((m) => norm(m.name) === norm(r.name) ||
+              (r.sug.part_number && m.part_number && m.part_number.toLowerCase() === r.sug.part_number.toLowerCase())) || null;
+            r.mode = r.match ? "add" : "new";
+            r.state = "ok";
+          }
+        } catch (e) { r.state = "err"; r.error = e.message; }
+        active--; draw(); pump();
+      })();
+    }
+  };
+  const queue = (fs) => {
+    fs.forEach((f) => { const r = { file: f, preview: URL.createObjectURL(f), state: "busy", mode: "new" }; rows.push(r); pending.push(r); });
+    draw(); pump();
+  };
+  queue(files);
 }
 
 // ------------------------------------------------------------------ locations

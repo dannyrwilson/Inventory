@@ -129,12 +129,13 @@ class Dupes:
         mine = set(keys_for(data))
         if not mine:
             return None
-        for r in self.db.q("SELECT id, name, part_number, barcode FROM items"):
-            if r["id"] == exclude_id:
-                continue
-            if mine & set(keys_for(r)):
-                return r["id"]
-        return None
+        hits = [r["id"] for r in self.db.q("SELECT id, name, part_number, barcode FROM items")
+                if r["id"] != exclude_id and mine & set(keys_for(r))]
+        if not hits:
+            return None
+        hidden = self.hidden_ids() if len(hits) > 1 else set()
+        visible = [h for h in hits if h not in hidden]
+        return (visible or hits)[0]
 
     def ignore(self, ids):
         ids = sorted(set(int(i) for i in ids))
