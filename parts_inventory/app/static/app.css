@@ -324,3 +324,15 @@ img { display: block; }
   .sheet.full { height: 86vh; }
   .sheet .grab { display: none; }
 }
+
+/* box scan */
+.brow { align-items: flex-start; }
+.brow.off .main { opacity: .45; }
+.check { flex: none; width: 26px; height: 26px; margin-top: 4px; border-radius: 50%; border: 1.5px solid var(--text3); background: none; color: transparent; font-size: 14px; padding: 0; line-height: 22px; }
+.check.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+.bname { width: 100%; border: 0; background: none; outline: none; font-size: 17px; padding: 2px 0; color: var(--text); }
+.bname:focus { border-bottom: 1px solid var(--accent); }
+.pill { flex: none; border: 0; border-radius: 99px; padding: 5px 11px; font-size: 13px; font-weight: 600; margin-top: 3px; background: var(--fill); color: var(--text2); }
+.pill.new { background: rgba(10,132,255,.15); color: var(--accent); }
+.pill.add { background: rgba(48,177,88,.16); color: var(--green); }
+.sticky-cta { position: sticky; bottom: 0; padding: 12px 16px calc(var(--safe-b) + 8px); background: linear-gradient(to top, var(--bg) 70%, transparent); }

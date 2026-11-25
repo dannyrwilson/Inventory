@@ -148,7 +148,10 @@ def store_uploads(item_id=None, location_id=None):
 
 
 def remove_files(names):
-    for n in names:
+    for n in set(names):
+        # a file can be shared (e.g. one box photo attached to many items)
+        if db.one("SELECT 1 FROM photos WHERE filename=? LIMIT 1", (n,)):
+            continue
         for d in (PHOTO_DIR, THUMB_DIR):
             try:
                 os.remove(os.path.join(d, n))
@@ -593,6 +596,115 @@ def ai_identify():
                 matches.append(r)
     result["matches"] = matches[:8]
     return jsonify(result)
+
+
+def _strong_match(entry):
+    """Best existing item for a detected label, only when it's a confident match."""
+    pn = (entry.get("part_number") or "").strip()
+    if pn:
+        r = db.one("SELECT id FROM items WHERE part_number=? COLLATE NOCASE AND part_number!=''", (pn,))
+        if r:
+            return r["id"]
+    for text in (entry.get("label_text"), entry.get("name")):
+        if not text or text.strip() == "?":
+            continue
+        rows, _ = db.search_items(q=text, limit=1, sort="relevance")
+        if rows:
+            return rows[0]["id"]
+    return None
+
+
+@app.post("/api/ai/identify-box")
+def ai_identify_box():
+    """Read every labelled compartment of an organizer / picking box."""
+    photo_rows = store_uploads() if request.files else []
+    ids = request.form.get("photo_ids", "")
+    for pid in [p for p in ids.split(",") if p.strip().isdigit()]:
+        r = db.one("SELECT id, filename FROM photos WHERE id=?", (int(pid),))
+        if r:
+            photo_rows.append(r)
+    if not photo_rows:
+        return err("No photo")
+    result = {"photos": photo_rows, "items": []}
+    if not identifier.enabled:
+        result["error"] = "AI is not configured. Add an OpenAI API key in the add-on configuration."
+        return jsonify(result)
+    cats = [c["name"] for c in db.q("SELECT name FROM categories ORDER BY name")]
+    try:
+        found, model = identifier.identify_box(
+            [os.path.join(PHOTO_DIR, p["filename"]) for p in photo_rows], cats, request.form.get("hint", ""))
+    except Exception as e:
+        log.exception("AI box identify failed")
+        result["error"] = ai.friendly_error(e)
+        return jsonify(result)
+    match_ids = {}
+    for entry in found:
+        mid = _strong_match(entry)
+        if mid:
+            match_ids[mid] = None
+            entry["match_id"] = mid
+    if match_ids:
+        rows = db.decorate(db.q(db.item_row_sql() + " WHERE i.id IN (%s)" % ",".join("?" * len(match_ids)),
+                                list(match_ids)))
+        by_id = {r["id"]: r for r in rows}
+        for entry in found:
+            if entry.get("match_id") in by_id:
+                m = by_id[entry["match_id"]]
+                entry["match"] = {"id": m["id"], "name": m["name"], "quantity": m["quantity"],
+                                  "unit": m["unit"], "location_path": m["location_path"], "photo": m["photo"]}
+    result["items"] = found
+    result["model"] = model
+    return jsonify(result)
+
+
+@app.post("/api/items/batch")
+def create_items_batch():
+    """Create many items at once (e.g. everything read from a picking box)."""
+    d = body()
+    entries = d.get("items") or []
+    if not entries:
+        return err("Nothing to add")
+    location_id = d.get("location_id") or None
+    photo_ids = [int(p) for p in d.get("photo_ids") or []]
+    created, stocked = [], []
+    for e in entries:
+        if e.get("add_to_id"):
+            # already have it: bump existing stock instead of duplicating
+            if db.adjust(int(e["add_to_id"]), float(e.get("quantity") or 1), "Stocked from box scan") is not None:
+                db.reindex(int(e["add_to_id"]))
+                stocked.append(int(e["add_to_id"]))
+            continue
+        data = {k: e.get(k) for k in ("name", "description", "part_number", "manufacturer", "tags") if e.get(k)}
+        if not data.get("name"):
+            continue
+        notes = []
+        if e.get("label_text") and e["label_text"] != "?" and e["label_text"] != data["name"]:
+            notes.append(f"Label: {e['label_text']}")
+        if e.get("position"):
+            notes.append(f"Position: {e['position']}")
+        data["notes"] = "\n".join(notes)
+        data["quantity"] = float(e.get("quantity") or 1)
+        data["location_id"] = location_id
+        if e.get("category"):
+            data["category_id"] = get_or_create_category(e["category"])
+        item_id = db.create_item(data, reason="Box scan")
+        if photo_ids:
+            # share the box photo: attach a reference copy to each item
+            with db.tx() as c:
+                for pid in photo_ids:
+                    src = c.execute("SELECT filename, width, height FROM photos WHERE id=?", (pid,)).fetchone()
+                    if src:
+                        cur = c.execute("INSERT INTO photos(item_id, filename, width, height, created_at) "
+                                        "VALUES (?,?,?,?,?)", (item_id, src["filename"], src["width"], src["height"], now()))
+                        c.execute("UPDATE items SET primary_photo_id=COALESCE(primary_photo_id, ?) WHERE id=?",
+                                  (cur.lastrowid, item_id))
+        created.append(item_id)
+    # keep the box photo on the location too
+    if location_id and photo_ids:
+        with db.tx() as c:
+            for pid in photo_ids:
+                c.execute("UPDATE photos SET location_id=? WHERE id=? AND item_id IS NULL", (int(location_id), pid))
+    return jsonify({"created": created, "stocked": stocked})
 
 
 # import / export

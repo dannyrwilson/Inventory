@@ -5,6 +5,7 @@ Raspberry Pi (HA OS) and shows up in the HA sidebar.
 
 - 📸 **Snap to stock**: tap the camera, take a photo, and either create a new item or add stock to one you already have
 - ✨ **AI identification (optional)**: OpenAI (or Claude, if you prefer) looks at the photo and fills in the name, description, category, part number and tags, and suggests matching items you already own
+- 🗃️ **Scan a whole picking box**: one photo of an organizer box, and AI reads every compartment label and adds them all (stock 1 each)
 - 🔎 **Fast search**: SQLite full-text search across names, part numbers (`7805` finds `LM7805`), tags, notes, categories and locations
 - 🔗 **Linked items**: part of / has part, compatible with, replacement for, accessory, requires, related
 - 📍 **Nested locations**: Garage › Shelf A › Bin 3, with photos of each spot
@@ -50,7 +51,10 @@ Access through the HA sidebar never asks for this password.
 - **Camera button** (centre of the tab bar): take a photo. If it contains one of your QR labels or a known
   barcode, you jump straight to that item with +/− buttons. Otherwise you can create a new item from the
   photo (with AI if configured) or add stock to an existing item. **Long-press** the camera button for the
-  photo library, scan-only, or a new item with no photo.
+  photo library, **Scan Whole Box**, scan-only, or a new item with no photo.
+- **Scan a picking box**: Home → *Scan a whole picking box*, or a location → *Scan box contents into here*.
+  Shoot straight on, close and well lit so the labels are readable. Review the list (rename, skip, or +1
+  items you already have), pick a location, and tap **Add**. Each new item gets stock 1 and the box photo.
 - **Item page**: tap +/− to adjust stock. Tap the number to set an exact count. Use *Link* to connect related
   parts and *Label* to print a QR label. Long-press a linked item to unlink it.
 - **Places**: build your location tree and add a photo of each shelf or bin. You can print labels for a

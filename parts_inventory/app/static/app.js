@@ -360,6 +360,7 @@ route(/^\/$/, async (view) => {
     ${s.items ? `<div class="section-h"><span>Quick actions</span></div>
     <div class="group">
       <button class="row" id="qa-snap"><span class="ico">${I.camera}</span><div class="main">Snap &amp; identify</div>${I.chev}</button>
+      ${cfg.ai_enabled ? `<button class="row" id="qa-box"><span class="ico" style="background:#00c7be">${I.grid}</span><div class="main">Scan a whole picking box</div>${I.chev}</button>` : ""}
       <button class="row" id="qa-scan"><span class="ico" style="background:#5856d6">${I.qr}</span><div class="main">Scan a label or barcode</div>${I.chev}</button>
       <button class="row" id="qa-new"><span class="ico" style="background:#34c759">${I.plus}</span><div class="main">New item</div>${I.chev}</button>
       <a class="row" href="#/activity"><span class="ico" style="background:#ff9500">${I.clock}</span><div class="main">Activity</div>${I.chev}</a>
@@ -371,6 +372,7 @@ route(/^\/$/, async (view) => {
   const q = (id, fn) => { const e = $(id); if (e) e.onclick = fn; };
   q("#qa-snap", () => snap("camera"));
   q("#qa-scan", () => scanFlow());
+  q("#qa-box", () => boxScan());
   q("#qa-new", () => itemForm());
 }, "home");
 
@@ -854,10 +856,12 @@ longPress(document.getElementById("snapbtn"), async () => {
   const v = await actionSheet([
     { label: "Take Photo", value: "camera", icon: I.camera },
     { label: "Photo Library", value: "library", icon: I.image },
+    { label: "Scan Whole Box (many labels)", value: "box", icon: I.grid },
     { label: "Scan Label / Barcode", value: "scan", icon: I.qr },
     { label: "New Item (no photo)", value: "new", icon: I.plus },
   ]);
-  if (v === "scan") scanFlow();
+  if (v === "box") boxScan();
+  else if (v === "scan") scanFlow();
   else if (v === "new") itemForm();
   else if (v) snap(v);
 });
@@ -872,7 +876,7 @@ async function snap(source) {
     title: cfg.ai_enabled ? "Identify" : "New from Photo", full: true,
     left: { label: "Cancel", fn: () => s.close() },
     body: `<div class="snap-preview ${cfg.ai_enabled ? "scanning" : ""}" id="sp"><img src="${previewURL}"></div><div id="out"><div class="status"><span class="spinner"></span> ${cfg.ai_enabled ? "Identifying…" : "Uploading…"}</div></div>`,
-    onClose: () => URL.revokeObjectURL(previewURL),
+    onClose: () => setTimeout(() => URL.revokeObjectURL(previewURL), 120000),
   });
   const out = $("#out", s.el);
 
@@ -911,6 +915,7 @@ async function snap(source) {
     <div class="section-h">Other options</div>
     <div class="group">
       <button class="row" id="addexisting"><span class="ico" style="background:#5856d6">${I.search}</span><div class="main">Add to an existing item…</div>${I.chev}</button>
+      ${cfg.ai_enabled ? `<button class="row" id="isbox"><span class="ico" style="background:#00c7be">${I.grid}</span><div class="main">It's a box of many labelled parts</div>${I.chev}</button>` : ""}
       <button class="row" id="morephotos"><span class="ico" style="background:#8e8e93">${I.camera}</span><div class="main">Add another angle${cfg.ai_enabled ? " & re-identify" : ""}</div>${I.chev}</button>
     </div>`;
   $("#mknew", s.el).onclick = newFromPhoto;
@@ -935,6 +940,8 @@ async function snap(source) {
     const t = await pickItem({ title: "Add to…", initial: sug ? sug.name.split(" ").slice(0, 2).join(" ") : "" });
     if (t) addTo(t.id, 1);
   };
+  const ib = $("#isbox", s.el);
+  if (ib) ib.onclick = () => { s.close(); boxScan(null, photos, previewURL); };
   $("#morephotos", s.el).onclick = async () => {
     const more = await choosePhotos();
     if (!more.length) return;
@@ -983,6 +990,109 @@ async function scanFlow() {
   }
 }
 
+
+// ------------------------------------------------------------------ box scan (many labels)
+async function boxScan(presetLocation, existingPhotos, existingPreview) {
+  const cfg = await config();
+  if (!cfg.ai_enabled) { toast("Box scan needs AI — add an OpenAI key in the add-on configuration"); return; }
+  let shrunk = [], previewURL = existingPreview || "";
+  if (!existingPhotos) {
+    const files = await pickFiles("camera");
+    if (!files.length) return;
+    shrunk = await Promise.all(files.map((f) => shrink(f, 2600)));
+    previewURL = URL.createObjectURL(shrunk[0].blob);
+  }
+  const s = openSheet({
+    title: "Scan Box", full: true,
+    left: { label: "Cancel", fn: () => s.close() },
+    body: `<div class="snap-preview scanning" id="sp"><img src="${previewURL}" style="max-height:28vh"></div>
+      <div id="out"><div class="status"><span class="spinner"></span> Reading every label…</div>
+      <div class="help" style="text-align:center">Big boxes can take up to a minute.</div></div>`,
+    onClose: () => { if (!existingPreview) URL.revokeObjectURL(previewURL); },
+  });
+  const out = $("#out", s.el);
+  const fd = existingPhotos ? new FormData() : formWithPhotos(shrunk.map((x) => x.blob));
+  if (existingPhotos) fd.append("photo_ids", existingPhotos.map((p) => p.id).join(","));
+  let res;
+  try { res = await POST("api/ai/identify-box", fd); }
+  catch (e) { out.innerHTML = `<div class="empty">${I.alert}<div>${esc(e.message)}</div></div>`; return; }
+  $("#sp", s.el).classList.remove("scanning");
+  if (res.error) { out.innerHTML = `<div class="empty">${I.alert}<div>${esc(res.error)}</div></div>`; return; }
+  const photos = res.photos;
+  // mode: "new" | "add" (+1 to existing) | "skip"
+  const rows = res.items.map((it) => ({ ...it, quantity: 1, mode: it.match ? "skip" : "new" }));
+  if (!rows.length) { out.innerHTML = `<div class="empty">${I.search}<div>No labels found. Try a straighter, closer, well-lit photo.</div></div>`; return; }
+  const locs = await locations();
+  const modeLabel = { new: "New", add: "+1 existing", skip: "Skip" };
+  const draw = () => {
+    const n = rows.filter((r) => r.mode !== "skip").length;
+    out.innerHTML = `
+      <div class="subtitle" style="margin:12px 16px 4px">Found ${rows.length} label${rows.length === 1 ? "" : "s"}. Each is added with stock 1. Tap a name to fix it.</div>
+      <div class="form"><div class="group" style="margin-top:8px"><div class="field"><label>Put in</label><select id="bloc">${locationOptions(locs, presetLocation)}</select></div></div></div>
+      <div class="help">The box photo is attached to every item${presetLocation ? "" : " and saved on the location"}.</div>
+      <div class="section-h"><span>Items</span><a href="#" id="toggleall">${n === rows.length ? "Skip all" : "Select all"}</a></div>
+      <div class="group">${rows.map((r, i) => `
+        <div class="row brow ${r.mode === "skip" ? "off" : ""}" data-i="${i}">
+          <button class="check ${r.mode === "skip" ? "" : "on"}" data-check="${i}" aria-label="Include">✓</button>
+          <div class="main">
+            <input class="bname" data-name="${i}" value="${esc(r.name)}">
+            <div class="s">${esc([r.label_text && r.label_text !== r.name ? `“${r.label_text}”` : "", r.position, r.category].filter(Boolean).join(" · "))}</div>
+            ${r.match ? `<div class="s" style="color:var(--orange)">Already have: ${esc(r.match.name)} (${fmt(r.match.quantity)})</div>` : ""}
+          </div>
+          <button class="pill ${r.mode}" data-mode="${i}">${modeLabel[r.mode]}</button>
+        </div>`).join("")}</div>
+      <div style="height:90px"></div>
+      <div class="sticky-cta"><button class="btn block" id="addall" ${n ? "" : "disabled"}>${I.plus} Add ${n} item${n === 1 ? "" : "s"}</button></div>`;
+    $("#bloc", out).onchange = async (e) => {
+      if (e.target.value === "__new") {
+        const id = await newLocationPrompt();
+        presetLocation = id || "";
+        locs.splice(0, locs.length, ...(await locations(true)));
+        draw();
+      } else presetLocation = e.target.value;
+    };
+    $$("[data-name]", out).forEach((inp) => (inp.oninput = () => (rows[+inp.dataset.name].name = inp.value)));
+    $$("[data-check]", out).forEach((b) => (b.onclick = () => {
+      haptic(); const r = rows[+b.dataset.check];
+      r.mode = r.mode === "skip" ? (r.match ? "add" : "new") : "skip"; draw();
+    }));
+    $$("[data-mode]", out).forEach((b) => (b.onclick = async () => {
+      const r = rows[+b.dataset.mode];
+      const opts = [{ label: "Add as new item", value: "new" }];
+      if (r.match) opts.push({ label: `+1 to “${r.match.name.slice(0, 30)}”`, value: "add" });
+      opts.push({ label: "Skip", value: "skip" });
+      const v = await actionSheet(opts, r.name);
+      if (v) { r.mode = v; draw(); }
+    }));
+    $("#toggleall", out).onclick = (e) => {
+      e.preventDefault();
+      const allOn = rows.every((r) => r.mode !== "skip");
+      rows.forEach((r) => (r.mode = allOn ? "skip" : (r.mode === "skip" ? (r.match ? "add" : "new") : r.mode)));
+      draw();
+    };
+    $("#addall", out).onclick = async () => {
+      const chosen = rows.filter((r) => r.mode !== "skip" && r.name.trim());
+      if (!chosen.length) return;
+      const btn = $("#addall", out); btn.disabled = true; btn.innerHTML = `<span class="spinner"></span> Adding…`;
+      try {
+        const r = await POST("api/items/batch", {
+          location_id: presetLocation || null,
+          photo_ids: photos.map((p) => p.id),
+          items: chosen.map((c) => c.mode === "add" ? { add_to_id: c.match.id, quantity: 1 }
+            : { name: c.name.trim(), description: c.description, category: c.category, part_number: c.part_number,
+                manufacturer: c.manufacturer, tags: c.tags, label_text: c.label_text, position: c.position, quantity: 1 }),
+        });
+        invalidate(); haptic(20); s.close();
+        const msg = [r.created.length ? `Added ${r.created.length} item${r.created.length === 1 ? "" : "s"}` : "", r.stocked.length ? `stocked ${r.stocked.length}` : ""].filter(Boolean).join(", ");
+        toast(msg || "Done");
+        location.hash = presetLocation ? `#/location/${presetLocation}` : "#/items?sort=created";
+        refresh();
+      } catch (e) { fail(e); btn.disabled = false; btn.innerHTML = `${I.plus} Retry`; }
+    };
+  };
+  draw();
+}
+
 // ------------------------------------------------------------------ locations
 route(/^\/locations$/, async (view) => {
   const locs = await locations(true);
@@ -1020,11 +1130,13 @@ route(/^\/location\/(\d+)$/, async (view, [id]) => {
     ${parentPath ? `<div class="subtitle"><a href="#/location/${loc.parent_id}">${esc(parentPath)}</a></div>` : ""}
     ${loc.description ? `<div style="margin:0 16px 10px">${esc(loc.description)}</div>` : ""}
     <div class="btnrow"><button class="btn gray small" id="additem">${I.plus} Item here</button><button class="btn gray small" id="addsub">${I.folder} Sub-location</button></div>
+    ${(await config()).ai_enabled ? `<div class="btnrow" style="margin-top:8px"><button class="btn gray small" id="scanbox">${I.grid} Scan box contents into here</button></div>` : ""}
     ${loc.children.length ? `<div class="section-h">Inside</div><div class="group">${kids(+id).map((l) => locRow(l, total(l), kids(l.id).length)).join("")}</div>` : ""}
     <div class="section-h"><span>Items${items.total ? ` (${items.total})` : ""}</span></div>
     ${items.items.length ? `<div class="group">${items.items.map((i) => itemRow(i)).join("")}</div>` : `<div class="group"><div class="row"><span class="s">Nothing here yet</span></div></div>`}
   </div>`;
   $("#additem").onclick = () => itemForm({ location_id: +id });
+  const sb = $("#scanbox"); if (sb) sb.onclick = () => boxScan(+id);
   $("#addsub").onclick = async () => { const nid = await newLocationPrompt(+id); if (nid) refresh(); };
   $("#lmore").onclick = async () => {
     const v = await actionSheet([
