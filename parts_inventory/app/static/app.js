@@ -63,7 +63,7 @@ async function api(method, url, data) {
   let j = null;
   try { j = await r.json(); } catch (e) {}
   if (r.status === 401) { location.reload(); throw new Error("Unauthorized"); }
-  if (!r.ok) throw new Error((j && j.error) || `Request failed (${r.status})`);
+  if (!r.ok) { const e = new Error((j && j.error) || `Request failed (${r.status})`); e.status = r.status; e.data = j; throw e; }
   return j;
 }
 const GET = (u) => api("GET", u);
@@ -369,6 +369,7 @@ route(/^\/$/, async (view) => {
     </div>
     ${s.items === 0 ? `<div class="empty">${I.camera}<div><b>Start by snapping a photo</b></div><div>Tap the camera button to add your first part${cfg.ai_enabled ? " — AI will fill in the details" : ""}.</div>
       <button class="btn" id="firstsnap">${I.camera} Snap a part</button></div>` : ""}
+    ${s.duplicates ? `<div class="group" style="margin-top:14px"><a class="row" href="#/duplicates"><span class="ico" style="background:#ff9500">${I.copy}</span><div class="main"><div class="t">${s.duplicates} duplicate${s.duplicates === 1 ? "" : "s"} hidden</div><div class="s">Review and merge them</div></div>${I.chev}</a></div>` : ""}
     ${s.low_items.length ? `<div class="section-h"><span>Low stock</span><a href="#/items?low=1">See all</a></div><div class="hscroll">${s.low_items.map(itemCard).join("")}</div>` : ""}
     ${s.recent.length ? `<div class="section-h"><span>Recently updated</span><a href="#/items">See all</a></div><div class="hscroll">${s.recent.map(itemCard).join("")}</div>` : ""}
     ${s.items ? `<div class="section-h"><span>Quick actions</span></div>
@@ -409,6 +410,7 @@ route(/^\/items$/, async (view, _, params) => {
       <button class="chip ${!listState.low && !listState.favorite && !listState.category ? "on" : ""}" data-f="all">All</button>
       <button class="chip ${listState.low ? "on" : ""}" data-f="low">Low stock</button>
       <button class="chip ${listState.favorite ? "on" : ""}" data-f="fav">★ Favorites</button>
+      <a class="chip dupchip" id="dupchip" href="#/duplicates" hidden></a>
       ${cats.filter((c) => !c.parent_id && c.total_count).map((c) => `<button class="chip ${+listState.category === c.id ? "on" : ""}" data-c="${c.id}">${c.color ? `<span class="dot" style="background:${esc(c.color)}"></span>` : ""}${esc(c.name)}</button>`).join("")}
     </div>
     <div id="count" class="subtitle" style="margin-top:0"></div>
@@ -441,6 +443,8 @@ route(/^\/items$/, async (view, _, params) => {
     }
     offset += res.items.length;
     $("#count").textContent = total ? `${total.toLocaleString()} item${total === 1 ? "" : "s"}` : "";
+    const dc = $("#dupchip");
+    if (dc) { dc.hidden = !res.duplicates; dc.textContent = `⧉ Duplicates (${res.duplicates})`; }
     $("#more").textContent = offset < total ? "Loading…" : "";
     loading = false;
   };
@@ -803,7 +807,29 @@ async function itemForm(item = {}, opts = {}) {
     if (!data.name.trim()) { toast("Give it a name"); F("name").focus(); return; }
     s.buttons.right.disabled = true;
     try {
-      const res = isNew ? await POST("api/items", data) : await PUT(`api/items/${item.id}`, data);
+      let res;
+      try {
+        res = isNew ? await POST("api/items", data) : await PUT(`api/items/${item.id}`, data);
+      } catch (e) {
+        if (e.status !== 409 || !e.data || !e.data.duplicate) throw e;
+        const ex = e.data.duplicate;
+        const q = +data.quantity || 0;
+        const v = await actionSheet([
+          ...(q ? [{ label: `Add ${fmt(q)} to “${ex.name.slice(0, 28)}”`, value: "add" }] : []),
+          { label: "Open existing item", value: "open" },
+          { label: "Create anyway (it's different)", value: "force" },
+        ], `You already have “${ex.name}” (${fmt(ex.quantity)} ${ex.unit || ""}).`);
+        if (!v) { s.buttons.right.disabled = false; return; }
+        if (v === "add") {
+          await POST(`api/items/${ex.id}/adjust`, { delta: q, reason: "Added (duplicate avoided)" });
+          if (data.photo_ids.length) await PUT(`api/items/${ex.id}`, { photo_ids: data.photo_ids });
+          res = ex;
+        } else if (v === "open") {
+          s.close(); location.hash = `#/item/${ex.id}`; return;
+        } else {
+          res = await POST("api/items", { ...data, allow_duplicate: true });
+        }
+      }
       invalidate();
       haptic(15);
       s.close();
@@ -1247,6 +1273,7 @@ route(/^\/more$/, async (view) => {
       ${cfg.ai_enabled ? `<button class="row" id="autocat"><span class="ico" style="background:#bf5af2">${I.sparkle}</span><div class="main">Auto-categorize items</div>${I.chev}</button>` : ""}
       <a class="row" href="#/activity"><span class="ico" style="background:#ff9500">${I.clock}</span><div class="main">Activity</div>${I.chev}</a>
       <a class="row" href="#/items?low=1"><span class="ico" style="background:#ff3b30">${I.alert}</span><div class="main">Low stock</div><span class="v">${s.low || 0}</span>${I.chev}</a>
+      <a class="row" href="#/duplicates"><span class="ico" style="background:#ff9500">${I.copy}</span><div class="main">Duplicates</div><span class="v">${s.duplicates || ""}</span>${I.chev}</a>
       <button class="row" id="scan"><span class="ico" style="background:#5856d6">${I.qr}</span><div class="main">Scan label / barcode</div>${I.chev}</button>
     </div>
     <div class="section-h">Inventory value</div>
@@ -1274,7 +1301,7 @@ route(/^\/more$/, async (view) => {
     const fd = new FormData(); fd.append("file", f);
     toast("Importing…");
     const r = await POST("api/import.csv", fd).catch(fail);
-    if (r) { invalidate(); toast(`Imported ${r.created} new, ${r.updated} updated${r.errors.length ? `, ${r.errors.length} errors` : ""}`); if (r.errors.length) console.warn(r.errors); }
+    if (r) { invalidate(); toast(`Imported ${r.created} new, ${r.updated} updated${r.merged ? `, ${r.merged} merged into existing` : ""}${r.errors.length ? `, ${r.errors.length} errors` : ""}`); if (r.errors.length) console.warn(r.errors); }
   };
 }, "more");
 
@@ -1340,6 +1367,52 @@ route(/^\/categories$/, async (view) => {
       if (await confirmDanger("Delete category", c.parent_id ? "Items keep existing, just uncategorized." : "Deletes this group and its sub-categories. Items keep existing, just uncategorized.")) { await DEL(`api/categories/${c.id}`).catch(fail); invalidate(); refresh(); }
     }
   }));
+}, "more");
+
+// ------------------------------------------------------------------ duplicates
+route(/^\/duplicates$/, async (view) => {
+  const res = await GET("api/duplicates");
+  const groups = res.groups;
+  view.innerHTML = `<div class="page">${topbar({ title: "Duplicates", back: true })}
+    <div class="largetitle">Duplicates</div>
+    <div class="subtitle">Items that look like the same part. Extras are hidden from your item list until you merge them or mark them as different.</div>
+    ${groups.length ? `<div class="btnrow" style="margin-bottom:6px"><button class="btn" id="mergeall">${I.copy} Merge all ${res.count}</button></div>
+      <div class="help">Merging keeps the highlighted item, adds up stock, and moves photos, links and history onto it.</div>
+      ${groups.map((g, gi) => `<div class="section-h"><span>${esc(g.reasons.join(" · "))}</span></div>
+        <div class="group" data-g="${gi}">${g.items.map((it) => `
+          <div class="row thumb brow dupitem" data-id="${it.id}">
+            <button class="check ${it.id === g.keep_id ? "on" : ""}" data-keep="${gi}:${it.id}" aria-label="Keep this one">✓</button>
+            ${picHTML(it.photo)}
+            <a class="main" href="#/item/${it.id}" style="color:var(--text)"><div class="t">${esc(it.name)}</div>
+              <div class="s">${fmt(it.quantity)} ${esc(it.unit || "")} · #${it.id}${it.part_number ? " · " + esc(it.part_number) : ""}${it.category_name ? " · " + esc(it.category_name) : ""}</div></a>
+          </div>`).join("")}
+          <div class="row" style="gap:8px"><button class="btn small" data-merge="${gi}" style="flex:1">Merge into ✓</button><button class="btn small gray" data-ignore="${gi}" style="flex:1">Not duplicates</button></div>
+        </div>`).join("")}`
+      : `<div class="empty">${I.copy}<div>No duplicates. Nice and tidy.</div></div>`}
+  </div>`;
+  const keep = groups.map((g) => g.keep_id);
+  $$("[data-keep]", view).forEach((b) => (b.onclick = () => {
+    const [gi, id] = b.dataset.keep.split(":").map(Number);
+    keep[gi] = id; haptic();
+    $$(`[data-g="${gi}"] .check`, view).forEach((c) => c.classList.toggle("on", c.dataset.keep === `${gi}:${id}`));
+  }));
+  $$("[data-merge]", view).forEach((b) => (b.onclick = async () => {
+    const gi = +b.dataset.merge, g = groups[gi];
+    const others = g.items.map((i) => i.id).filter((i) => i !== keep[gi]);
+    await POST("api/duplicates/merge", { keep_id: keep[gi], merge_ids: others }).catch(fail);
+    haptic(15); toast(`Merged ${others.length + 1} into one`); refresh();
+  }));
+  $$("[data-ignore]", view).forEach((b) => (b.onclick = async () => {
+    const g = groups[+b.dataset.ignore];
+    await POST("api/duplicates/ignore", { ids: g.items.map((i) => i.id) }).catch(fail);
+    toast("Kept as separate items"); refresh();
+  }));
+  const ma = $("#mergeall");
+  if (ma) ma.onclick = async () => {
+    if (!(await confirmDanger(`Merge all ${res.count}`, "Each group becomes one item (keeping the one with the most info). Stock is added together."))) return;
+    const r = await POST("api/duplicates/merge-all").catch(fail);
+    if (r) { haptic(20); toast(`Merged ${r.merged} duplicate${r.merged === 1 ? "" : "s"}`); refresh(); }
+  };
 }, "more");
 
 // ------------------------------------------------------------------ auto-categorize

@@ -1,3 +1,9 @@
+## 1.4.0
+- Duplicate protection: adding an item you already have offers to add stock to it instead.
+  Box scans and CSV imports stock existing items rather than creating copies.
+- Existing duplicates (same name in any word order, part number or barcode) are hidden from the
+  item list and shown in a Duplicates tab with one-tap merge or "Not duplicates".
+
 ## 1.3.0
 - Built-in two-level category tree (26 groups / 326 sub-categories), pre-loaded on first start.
 - Auto-categorize: items saved without a category are sorted in the background; bulk review screen.

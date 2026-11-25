@@ -346,3 +346,6 @@ img { display: block; }
 .expander svg { transition: transform .2s; color: var(--text2); }
 .expander.open svg { transform: rotate(90deg); }
 .chip.compat { background: rgba(48,177,88,.14); color: var(--green); }
+
+.chip.dupchip { background: rgba(255,149,0,.16); color: var(--orange); }
+.dupitem .check { margin-top: 16px; }

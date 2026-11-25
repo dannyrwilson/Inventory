@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from db import DB, RELATIONS, ITEM_FIELDS, now  # noqa: E402
 import ai  # noqa: E402
 import taxonomy  # noqa: E402
+import dupes  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("inventory")
@@ -52,6 +53,7 @@ def load_options():
 OPTS = load_options()
 db = DB(os.path.join(DATA_DIR, "inventory.db"))
 _provider = (OPTS.get("ai_provider") or "openai").lower()
+dup = dupes.Dupes(db)
 identifier = ai.Identifier(
     _provider,
     OPTS.get("anthropic_api_key") if _provider == "anthropic" else OPTS.get("openai_api_key"),
@@ -391,7 +393,10 @@ def config():
 @app.get("/api/stats")
 def stats():
     s = db.stats()
-    s["recent"] = db.decorate(db.q(db.item_row_sql() + " ORDER BY i.updated_at DESC LIMIT 12"))
+    hidden = dup.hidden_ids()
+    s["duplicates"] = len(hidden)
+    hide = (" WHERE i.id NOT IN (%s)" % ",".join(map(str, hidden))) if hidden else ""
+    s["recent"] = db.decorate(db.q(db.item_row_sql() + hide + " ORDER BY i.updated_at DESC LIMIT 12"))
     s["low_items"] = db.decorate(db.q(db.item_row_sql() + " WHERE i.min_quantity IS NOT NULL AND "
                                       "i.quantity<=i.min_quantity ORDER BY i.quantity ASC LIMIT 12"))
     return jsonify(s)
@@ -400,20 +405,28 @@ def stats():
 @app.get("/api/items")
 def list_items():
     a = request.args
+    # duplicates are hidden from the main list and live in the Duplicates tab
+    hidden = dup.hidden_ids() if a.get("duplicates") != "show" else set()
     rows, total = db.search_items(
         q=a.get("q", ""), location_id=a.get("location"), category_id=a.get("category"),
         low=a.get("low") == "1", favorite=a.get("favorite") == "1", sort=a.get("sort", "updated"),
-        limit=min(int(a.get("limit", 60)), 500), offset=int(a.get("offset", 0)))
-    return jsonify({"items": rows, "total": total})
+        limit=min(int(a.get("limit", 60)), 500), offset=int(a.get("offset", 0)), exclude=hidden)
+    return jsonify({"items": rows, "total": total, "duplicates": len(hidden)})
 
 
 @app.post("/api/items")
 def create_item():
     data = body()
     try:
+        existing = dup.find_existing(data)
+        if existing and not data.get("allow_duplicate"):
+            it = db.get_item(existing)
+            return jsonify({"error": f"You already have “{it['name']}”", "duplicate": it}), 409
         if data.get("category_name") and not data.get("category_id"):
             data["category_id"] = get_or_create_category(data["category_name"])
         item_id = db.create_item(data, data.get("photo_ids") or [])
+        if existing:
+            dup.ignore([item_id, existing])  # user chose "create anyway"
     except ValueError as e:
         return err(str(e))
     return jsonify(db.get_item(item_id)), 201
@@ -845,6 +858,12 @@ def create_items_batch():
             notes.append(f"Position: {e['position']}")
         data["notes"] = "\n".join(notes)
         data["quantity"] = float(e.get("quantity") or 1)
+        existing = dup.find_existing(data)
+        if existing:
+            db.adjust(existing, data["quantity"], "Stocked from box scan")
+            db.reindex(existing)
+            stocked.append(existing)
+            continue
         data["location_id"] = location_id
         if e.get("category"):
             data["category_id"] = get_or_create_category(e["category"])
@@ -899,6 +918,47 @@ def ai_categorize_apply():
     return jsonify({"updated": apply_categories(a)})
 
 
+# duplicates
+@app.get("/api/duplicates")
+def list_duplicates():
+    out = []
+    for g in dup.groups():
+        keep = dup.keeper(g["ids"])
+        rows = db.decorate(db.q(db.item_row_sql() + " WHERE i.id IN (%s)" % ",".join(map(str, g["ids"]))))
+        rows.sort(key=lambda r: (r["id"] != keep, r["id"]))
+        out.append({"keep_id": keep, "reasons": g["reasons"], "items": rows})
+    return jsonify({"groups": out, "count": sum(len(g["items"]) - 1 for g in out)})
+
+
+@app.post("/api/duplicates/merge")
+def merge_duplicates():
+    d = body()
+    keep, others = int(d.get("keep_id") or 0), d.get("merge_ids") or []
+    if not keep or not others or not dup.merge(keep, others):
+        return err("Nothing to merge")
+    return jsonify(db.get_item(keep))
+
+
+@app.post("/api/duplicates/merge-all")
+def merge_all_duplicates():
+    n = 0
+    for g in dup.groups():
+        keep = dup.keeper(g["ids"])
+        others = [i for i in g["ids"] if i != keep]
+        if dup.merge(keep, others):
+            n += len(others)
+    return jsonify({"merged": n})
+
+
+@app.post("/api/duplicates/ignore")
+def ignore_duplicates():
+    ids = body().get("ids") or []
+    if len(ids) < 2:
+        return err("Pick at least two items")
+    dup.ignore(ids)
+    return jsonify({"ok": True})
+
+
 # import / export
 EXPORT_COLS = ["id", "name", "description", "category", "location", "quantity", "unit", "min_quantity",
                "part_number", "manufacturer", "barcode", "value", "tags", "notes", "url", "favorite",
@@ -943,7 +1003,7 @@ def import_csv():
         return err("No file")
     text = f.read().decode("utf-8-sig", errors="replace")
     reader = csv.DictReader(io.StringIO(text))
-    created = updated = 0
+    created = updated = merged = 0
     errors = []
     for n, row in enumerate(reader, start=2):
         row = {(k or "").strip().lower(): (v or "").strip() for k, v in row.items()}
@@ -960,11 +1020,17 @@ def import_csv():
                 db.update_item(int(rid), data)
                 updated += 1
             else:
-                db.create_item(data, reason="Imported")
-                created += 1
+                existing = dup.find_existing(data)
+                if existing:
+                    db.adjust(existing, float(data.get("quantity") or 0), "Imported (merged duplicate)")
+                    db.reindex(existing)
+                    merged += 1
+                else:
+                    db.create_item(data, reason="Imported")
+                    created += 1
         except Exception as e:
             errors.append(f"Row {n}: {e}")
-    return jsonify({"created": created, "updated": updated, "errors": errors[:50]})
+    return jsonify({"created": created, "updated": updated, "merged": merged, "errors": errors[:50]})
 
 
 @app.errorhandler(400)

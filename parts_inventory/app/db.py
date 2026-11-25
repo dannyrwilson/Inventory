@@ -268,7 +268,7 @@ class DB:
 
     def search_items(self, q="", location_id=None, category_id=None, low=False,
                      favorite=False, sort="updated", limit=100, offset=0, any_terms=False,
-                     _like=False):
+                     _like=False, exclude=None):
         where, args = [], []
         order = {
             "name": "i.name COLLATE NOCASE ASC",
@@ -308,6 +308,8 @@ class DB:
             where.append("i.min_quantity IS NOT NULL AND i.quantity <= i.min_quantity")
         if favorite:
             where.append("i.favorite=1")
+        if exclude:
+            where.append("i.id NOT IN (%s)" % ",".join(str(int(x)) for x in exclude))
         sql = self.item_row_sql().replace("FROM items i", f"FROM items i {join}")
         if where:
             sql += " WHERE " + " AND ".join(where)
@@ -318,10 +320,10 @@ class DB:
         if q and total == 0 and self.fts and not _like and not any_terms:
             # FTS only matches word prefixes; fall back to substring search
             return self.search_items(q, location_id, category_id, low, favorite, sort,
-                                     limit, offset, any_terms, _like=True)
+                                     limit, offset, any_terms, _like=True, exclude=exclude)
         if q and not offset:
             have = {r["id"] for r in rows}
-            extra = [e["id"] for e in exact if e["id"] not in have]
+            extra = [e["id"] for e in exact if e["id"] not in have and e["id"] not in (exclude or ())]
             if extra:
                 more = self.decorate(self.q(self.item_row_sql() + " WHERE i.id IN (%s)"
                                             % ",".join("?" * len(extra)), extra))
