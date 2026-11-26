@@ -135,6 +135,53 @@ SYSTEM += SHARED_CATEGORY_RULE
 BATCH_SYSTEM += SHARED_CATEGORY_RULE
 
 
+LIST_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "source_text": {"type": "string"},
+                    "name": {"type": "string"},
+                    "quantity": {"type": "number"},
+                    "unit": {"type": "string"},
+                    "description": {"type": "string"},
+                    "category": {"type": "string"},
+                    "manufacturer": {"type": "string"},
+                    "part_number": {"type": "string"},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                    "compatible_with": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["source_text", "name", "quantity", "unit", "description", "category",
+                             "manufacturer", "part_number", "tags", "compatible_with"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["items"],
+    "additionalProperties": False,
+}
+
+LIST_SYSTEM = """You turn a person's parts list (typed notes, a pasted shopping or order list, \
+or a photo of a handwritten / printed list or screenshot) into inventory items.
+
+For every part mentioned return one item:
+- source_text: the original line or fragment, as written.
+- name: a clear, specific inventory name expanded from shorthand
+  (e.g. "10x m3x10 shcs" -> "M3 x 10mm socket head cap screw", "esp32 wroom" -> "ESP32-WROOM-32 module").
+- quantity: the count given (10x, x10, (10), "ten", "pack of 10" -> 10); 1 if none is given.
+- unit: "pcs" unless the list says otherwise (m, ft, g, ml, roll, pack, box).
+- description: short specs implied by the text; empty string if nothing to add.
+- manufacturer, part_number: only if written; empty string otherwise.
+- tags: 1-4 short lowercase tags.
+- compatible_with: 0-5 short entries for what it fits / works with, only when clear.
+Ignore headings, prices, shipping lines, order numbers, dates and anything that isn't a part.
+Merge exact repeats of the same part into one item with the quantities added together."""
+LIST_SYSTEM += SHARED_CATEGORY_RULE
+
+
 def prepare_image(path, max_side=1568):
     im = Image.open(path)
     im = ImageOps.exif_transpose(im)
@@ -199,6 +246,17 @@ class Identifier:
         # bigger images so small labels stay legible
         data, model = self._call(image_paths[:3], text, BATCH_SYSTEM, BATCH_SCHEMA,
                                  "box_contents", max_side=2048, timeout=300.0)
+        return data.get("items") or [], model
+
+    def parse_list(self, text="", image_paths=(), categories=()):
+        """Parts list (text and/or photos of a list) -> items."""
+        prompt = "Turn this into inventory items."
+        if categories:
+            prompt += "\nCategory list:\n" + "\n".join(categories)
+        if text.strip():
+            prompt += "\n\nThe list:\n" + text.strip()[:20000]
+        data, model = self._call(list(image_paths)[:4], prompt, LIST_SYSTEM, LIST_SCHEMA, "parts_list",
+                                 max_side=2048, timeout=300.0)
         return data.get("items") or [], model
 
     def categorize(self, items, categories=()):

@@ -1,3 +1,8 @@
+## 1.7.0
+- Add from notes / list: paste a parts list or photograph a written one; AI (or a basic line reader
+  without AI) turns it into items with quantities. Review, edit quantities, then add; parts you
+  already have get their stock topped up instead of duplicated.
+
 ## 1.6.0
 - NIIMBOT D11 / D11_H label printing from the Pi over Bluetooth (ported from Distill Log; verified
   against its recorded protocol transcripts). Label length + firmware settings, live preview, test print.

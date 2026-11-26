@@ -13,6 +13,7 @@ Raspberry Pi (HA OS) and shows up in the HA sidebar.
 - 📍 **Nested locations**: Garage › Shelf A › Bin 3, with photos of each spot
 - 🏷️ **Label printer**: prints QR labels on a **NIIMBOT D11 / D11_H** straight from the Pi over Bluetooth (works from any phone), or on paper. Scan a label in the app to jump to that item
 - ⧉ **No duplicates**: adding something you already have offers to add stock instead; existing duplicates are hidden in a Duplicates tab with one-tap merge
+- 📝 **Add from notes / list**: paste a parts list (Notes, order emails, shopping lists) or photograph a written one. AI turns it into items with quantities and categories, and parts you already own get topped up
 - 🖼️ **Scan many photos at once**: pick a batch of photos (one part each) and add them all after a quick review
 - ➕➖ **Quick stock steppers**, low-stock alerts, history and activity log
 - 📱 **Feels native**: iOS-style UI, dark mode, swipe-to-dismiss sheets, haptics, installable PWA

@@ -363,3 +363,9 @@ img { display: block; }
 /* label preview */
 .labelprev { margin: 0 16px; background: var(--bg2); border-radius: var(--radius); padding: 16px; display: flex; justify-content: center; }
 .labelprev img { max-width: 100%; image-rendering: pixelated; border: 1px solid var(--sep); border-radius: 4px; background: #fff; }
+
+/* add from list */
+.qtyline { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+.bqty { width: 74px; border: 0; background: var(--fill); border-radius: 8px; padding: 5px 8px; font-size: 16px; outline: none; }
+.qtyline .pill { margin: 0 0 0 auto; }
+#ltext { font-size: 16px; min-height: 180px; }

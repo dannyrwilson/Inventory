@@ -6,6 +6,7 @@ import io
 import json
 import logging
 import os
+import re
 import secrets
 import sys
 import threading
@@ -847,12 +848,12 @@ def create_items_batch():
     for e in entries:
         if e.get("add_to_id"):
             # already have it: bump existing stock instead of duplicating
-            if db.adjust(int(e["add_to_id"]), float(e.get("quantity") or 1), "Stocked from box scan") is not None:
+            if db.adjust(int(e["add_to_id"]), float(e.get("quantity") or 1), e.get("reason") or "Stocked from box scan") is not None:
                 db.reindex(int(e["add_to_id"]))
                 stocked.append(int(e["add_to_id"]))
             continue
         data = {k: e.get(k) for k in ("name", "description", "part_number", "manufacturer", "tags",
-                                      "compatible_with") if e.get(k)}
+                                      "compatible_with", "unit") if e.get(k)}
         if not data.get("name"):
             continue
         notes = []
@@ -961,6 +962,67 @@ def ignore_duplicates():
         return err("Pick at least two items")
     dup.ignore(ids)
     return jsonify({"ok": True})
+
+
+# add from a list / notes
+_QTY_PATTERNS = [
+    re.compile(r"^(\d+(?:\.\d+)?)\s*(?:x|×|pcs?|pieces?)?\s+(.+)$", re.I),       # 10x M3 screw / 10 M3 screw
+    re.compile(r"^(.+?)\s*[x×]\s*(\d+(?:\.\d+)?)$", re.I),                        # M3 screw x10
+    re.compile(r"^(.+?)\s*\((\d+(?:\.\d+)?)\)$"),                                 # M3 screw (10)
+    re.compile(r"^(.+?)\s*[-–:]\s*(\d+(?:\.\d+)?)\s*(?:pcs?|pieces?)?$", re.I),     # M3 screw - 10
+]
+
+
+def parse_list_locally(text):
+    """No-AI fallback: one part per line, with an optional quantity."""
+    out = []
+    for raw in text.splitlines():
+        line = re.sub(r"^\s*(?:[-*•·▪◦]|\[[ xX]?\]|☐|☑|✓|\d+[.)])\s*", "", raw).strip()
+        if len(line) < 2:
+            continue
+        qty, name = 1.0, line
+        for i, pat in enumerate(_QTY_PATTERNS):
+            m = pat.match(line)
+            if m:
+                a, b = m.group(1), m.group(2)
+                qty, name = (float(a), b) if i == 0 else (float(b), a)
+                break
+        out.append({"source_text": raw.strip(), "name": name.strip(" ,;"), "quantity": qty or 1, "unit": "pcs",
+                    "description": "", "category": "", "manufacturer": "", "part_number": "", "tags": [],
+                    "compatible_with": []})
+    return out
+
+
+@app.post("/api/parse-list")
+def parse_list():
+    text = request.form.get("text", "") or ""
+    photo_rows = store_uploads() if request.files else []
+    if not text.strip() and not photo_rows:
+        return err("Paste a list or add a photo of one")
+    result = {"photos": photo_rows, "items": [], "ai": False}
+    if identifier.enabled:
+        try:
+            items, model = identifier.parse_list(text, [os.path.join(PHOTO_DIR, p["filename"]) for p in photo_rows],
+                                                 category_paths())
+            result.update(items=items, ai=True, model=model)
+        except Exception as e:
+            log.exception("List parse failed")
+            result["error"] = ai.friendly_error(e)
+            if not text.strip():
+                return jsonify(result)
+            result["items"] = parse_list_locally(text)
+    else:
+        if not text.strip():
+            result["error"] = "Reading a photo of a list needs AI. Add an OpenAI key, or paste the list as text."
+            return jsonify(result)
+        result["items"] = parse_list_locally(text)
+    # flag parts you already have (they get their stock topped up instead)
+    for it in result["items"]:
+        ex = dup.find_existing({"name": it.get("name"), "part_number": it.get("part_number")})
+        if ex:
+            r = db.one("SELECT id, name, quantity, unit FROM items WHERE id=?", (ex,))
+            it["match"] = r
+    return jsonify(result)
 
 
 # label printer (NIIMBOT D11 / D11_H via the Pi's Bluetooth)

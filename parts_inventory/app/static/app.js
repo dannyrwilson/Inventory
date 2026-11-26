@@ -404,6 +404,7 @@ route(/^\/$/, async (view) => {
       ${cfg.ai_enabled ? `<button class="row" id="qa-multi"><span class="ico" style="background:#ff2d55">${I.image}</span><div class="main">Scan multiple photos at once</div>${I.chev}</button>` : ""}
       ${cfg.ai_enabled ? `<button class="row" id="qa-box"><span class="ico" style="background:#00c7be">${I.grid}</span><div class="main">Scan a whole picking box</div>${I.chev}</button>` : ""}
       <button class="row" id="qa-scan"><span class="ico" style="background:#5856d6">${I.qr}</span><div class="main">Scan a label or barcode</div>${I.chev}</button>
+      <button class="row" id="qa-list"><span class="ico" style="background:#af52de">${I.list}</span><div class="main">Add from notes / list</div>${I.chev}</button>
       <button class="row" id="qa-new"><span class="ico" style="background:#34c759">${I.plus}</span><div class="main">New item</div>${I.chev}</button>
       <a class="row" href="#/activity"><span class="ico" style="background:#ff9500">${I.clock}</span><div class="main">Activity</div>${I.chev}</a>
     </div>
@@ -416,6 +417,7 @@ route(/^\/$/, async (view) => {
   q("#qa-scan", () => scanFlow());
   q("#qa-box", () => boxScan());
   q("#qa-multi", () => multiScan());
+  q("#qa-list", () => listAdd());
   q("#qa-new", () => itemForm());
 }, "home");
 
@@ -481,7 +483,16 @@ route(/^\/items$/, async (view, _, params) => {
   qi.onkeydown = (e) => { if (e.key === "Enter") qi.blur(); };
   $("#qclear").onclick = () => { qi.value = ""; listState.q = ""; qi.parentElement.classList.remove("has"); load(true); qi.focus(); };
   $("#qscan").onclick = () => scanFlow();
-  $("#addbtn").onclick = () => itemForm({ name: listState.q, category_id: listState.category || "" });
+  $("#addbtn").onclick = async () => {
+    const v = await actionSheet([
+      { label: "New item", value: "one", icon: I.plus },
+      { label: "Add from notes / list", value: "list", icon: I.list },
+      { label: "Scan multiple photos", value: "multi", icon: I.image },
+    ]);
+    if (v === "one") itemForm({ name: listState.q, category_id: listState.category || "" });
+    else if (v === "list") listAdd();
+    else if (v === "multi") multiScan();
+  };
   $("#viewbtn").onclick = () => { listState.view = listState.view === "grid" ? "list" : "grid"; store.set("view", listState.view); render(); };
   $("#sortbtn").onclick = async () => {
     const v = await actionSheet([
@@ -951,11 +962,13 @@ longPress(document.getElementById("snapbtn"), async () => {
     { label: "Take Photo", value: "camera", icon: I.camera },
     { label: "Photo Library", value: "library", icon: I.image },
     { label: "Scan Multiple Photos", value: "multi", icon: I.image },
+    { label: "Add From Notes / List", value: "list", icon: I.list },
     { label: "Scan Whole Box (many labels)", value: "box", icon: I.grid },
     { label: "Scan Label / Barcode", value: "scan", icon: I.qr },
     { label: "New Item (no photo)", value: "new", icon: I.plus },
   ]);
   if (v === "multi") multiScan();
+  else if (v === "list") listAdd();
   else if (v === "box") boxScan();
   else if (v === "scan") scanFlow();
   else if (v === "new") itemForm();
@@ -1301,6 +1314,111 @@ async function multiScan(files) {
     draw(); pump();
   };
   queue(files);
+}
+
+// ------------------------------------------------------------------ add from notes / list
+async function listAdd() {
+  const cfg = await config();
+  let photos = [];
+  const s = openSheet({
+    title: "Add from List", full: true,
+    left: { label: "Cancel", fn: () => s.close() },
+    body: `<div class="subtitle" style="margin:10px 16px">Paste a parts list from Notes, an order email or a shopping list${cfg.ai_enabled ? ", or photograph a written list" : ""}. One part per line works best, e.g. “10x M3 screws”.</div>
+      <div class="form"><div class="group"><div class="field stack"><textarea id="ltext" rows="9" placeholder="10x M3 x 10mm screws&#10;ESP32 dev board x2&#10;LM7805 (5)&#10;Red LEDs - 20"></textarea></div></div></div>
+      <div class="photostrip" id="lstrip"></div>
+      <div class="btnrow" style="margin-top:6px">
+        <button class="btn gray small" id="lpaste">${I.copy} Paste</button>
+        ${cfg.ai_enabled ? `<button class="btn gray small" id="lphoto">${I.camera} Photo of list</button>` : ""}
+      </div>
+      <div class="btnrow" style="margin-top:14px"><button class="btn" id="lread">${I.sparkle} Read list</button></div>
+      <div id="lout"></div>`,
+  });
+  const ta = $("#ltext", s.el);
+  setTimeout(() => ta.focus(), 380);
+  const strip = () => {
+    $("#lstrip", s.el).innerHTML = photos.map((p, i) => `<div class="ph"><img class="zoomable" src="${p.url}"><button type="button" class="x" data-i="${i}">✕</button></div>`).join("");
+    $$(".x", s.el).forEach((b) => (b.onclick = () => { photos.splice(+b.dataset.i, 1); strip(); }));
+  };
+  $("#lpaste", s.el).onclick = async () => {
+    try { const t = await navigator.clipboard.readText(); if (t) { ta.value = (ta.value ? ta.value + "\n" : "") + t; } else toast("Clipboard is empty"); }
+    catch (e) { toast("Long-press the box and choose Paste"); ta.focus(); }
+  };
+  const lp = $("#lphoto", s.el);
+  if (lp) lp.onclick = async () => {
+    const files = await choosePhotos();
+    for (const f of files) { const { blob } = await shrink(f, 2400); photos.push({ blob, url: URL.createObjectURL(blob) }); }
+    strip();
+  };
+  $("#lread", s.el).onclick = async () => {
+    if (!ta.value.trim() && !photos.length) { toast("Paste a list first"); return; }
+    const btn = $("#lread", s.el); btn.disabled = true; btn.innerHTML = `<span class="spinner"></span> Reading…`;
+    const fd = formWithPhotos(photos.map((p) => p.blob), { text: ta.value });
+    let res;
+    try { res = await POST("api/parse-list", fd); } catch (e) { fail(e); btn.disabled = false; btn.innerHTML = `${I.sparkle} Read list`; return; }
+    btn.disabled = false; btn.innerHTML = `${I.sparkle} Read again`;
+    if (res.error && !res.items.length) { toast(res.error); return; }
+    review(res);
+  };
+
+  function review(res) {
+    let presetLocation = "";
+    const rows = res.items.map((it) => ({ ...it, quantity: it.quantity || 1, mode: it.match ? "add" : "new" }));
+    const out = $("#lout", s.el);
+    const modeLabel = { new: "New", add: "+ existing", skip: "Skip" };
+    const draw = async () => {
+      const locs = await locations();
+      const n = rows.filter((r) => r.mode !== "skip").length;
+      out.innerHTML = `
+        ${res.error ? `<div class="help" style="color:var(--orange);margin-top:12px">${esc(res.error)} Read line by line instead.</div>` : ""}
+        <div class="section-h"><span>${rows.length} part${rows.length === 1 ? "" : "s"} found${res.ai ? "" : " (basic reading)"}</span></div>
+        <div class="form"><div class="group"><div class="field"><label>Put in</label><select id="lloc">${locationOptions(locs, presetLocation)}</select></div></div></div>
+        <div class="group" style="margin-top:10px">${rows.map((r, i) => `
+          <div class="row brow ${r.mode === "skip" ? "off" : ""}">
+            <button class="check ${r.mode === "skip" ? "" : "on"}" data-check="${i}">✓</button>
+            <div class="main">
+              <input class="bname" data-name="${i}" value="${esc(r.name)}">
+              <div class="s">${esc([r.source_text && r.source_text !== r.name ? `“${r.source_text}”` : "", r.category].filter(Boolean).join(" · "))}</div>
+              ${r.match ? `<div class="s" style="color:var(--orange)">Already have: ${esc(r.match.name)} (${fmt(r.match.quantity)} ${esc(r.match.unit || "")})</div>` : ""}
+              <div class="qtyline"><input class="bqty" data-qty="${i}" type="number" inputmode="decimal" min="0" step="any" value="${r.quantity}"><span class="s">${esc(r.unit || "pcs")}</span>
+                <button class="pill ${r.mode}" data-mode="${i}">${modeLabel[r.mode]}</button></div>
+            </div>
+          </div>`).join("")}</div>
+        <div style="height:90px"></div>
+        <div class="sticky-cta"><button class="btn block" id="lgo" ${n ? "" : "disabled"}>${I.plus} Add ${n} part${n === 1 ? "" : "s"}</button></div>`;
+      $("#lloc", out).onchange = async (e) => {
+        if (e.target.value === "__new") { presetLocation = (await newLocationPrompt()) || ""; await locations(true); draw(); }
+        else presetLocation = e.target.value;
+      };
+      $$("[data-name]", out).forEach((inp) => (inp.oninput = () => (rows[+inp.dataset.name].name = inp.value)));
+      $$("[data-qty]", out).forEach((inp) => (inp.oninput = () => (rows[+inp.dataset.qty].quantity = +inp.value || 0)));
+      $$("[data-check]", out).forEach((b) => (b.onclick = () => { const r = rows[+b.dataset.check]; r.mode = r.mode === "skip" ? (r.match ? "add" : "new") : "skip"; haptic(); draw(); }));
+      $$("[data-mode]", out).forEach((b) => (b.onclick = async () => {
+        const r = rows[+b.dataset.mode];
+        const opts = [];
+        if (r.match) opts.push({ label: `Add ${fmt(r.quantity)} to “${r.match.name.slice(0, 28)}”`, value: "add" });
+        opts.push({ label: "Add as new item", value: "new" }, { label: "Skip", value: "skip" });
+        const v = await actionSheet(opts, r.name); if (v) { r.mode = v; draw(); }
+      }));
+      $("#lgo", out).onclick = async () => {
+        const chosen = rows.filter((r) => r.mode !== "skip" && r.name.trim());
+        const btn = $("#lgo", out); btn.disabled = true; btn.innerHTML = `<span class="spinner"></span> Adding…`;
+        try {
+          const r = await POST("api/items/batch", {
+            location_id: presetLocation || null,
+            items: chosen.map((c) => c.mode === "add" ? { add_to_id: c.match.id, quantity: c.quantity || 1, reason: "Added from list" } : {
+              name: c.name.trim(), quantity: c.quantity || 1, unit: c.unit, description: c.description, category: c.category,
+              part_number: c.part_number, manufacturer: c.manufacturer, tags: c.tags, compatible_with: c.compatible_with }),
+          });
+          invalidate(); haptic(20); s.close();
+          toast([r.created.length ? `Added ${r.created.length} new` : "", r.stocked.length ? `topped up ${r.stocked.length}` : ""].filter(Boolean).join(", ") || "Done");
+          location.hash = presetLocation ? `#/location/${presetLocation}` : "#/items";
+          refresh();
+        } catch (e) { fail(e); btn.disabled = false; btn.innerHTML = `${I.plus} Retry`; }
+      };
+      out.scrollIntoView({ behavior: "smooth", block: "start" });
+    };
+    draw();
+  }
 }
 
 // ------------------------------------------------------------------ locations
