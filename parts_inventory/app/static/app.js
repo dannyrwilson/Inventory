@@ -67,6 +67,16 @@ async function api(method, url, data) {
   return j;
 }
 const GET = (u) => api("GET", u);
+// Poll a background job until it finishes; onProgress(done, total) while it runs.
+async function pollJob(id, onProgress) {
+  for (;;) {
+    await new Promise((r) => setTimeout(r, 900));
+    const j = await GET(`api/jobs/${id}`);
+    if (onProgress) onProgress(j.done, j.total);
+    if (j.status === "done") return j.result;
+    if (j.status === "error") throw new Error(j.error || "Failed");
+  }
+}
 const POST = (u, d) => api("POST", u, d ?? {});
 const PUT = (u, d) => api("PUT", u, d);
 const DEL = (u) => api("DELETE", u);
@@ -373,7 +383,7 @@ async function render() {
   }
   location.hash = "#/";
 }
-window.addEventListener("hashchange", () => { render(); window.scrollTo(0, 0); });
+window.addEventListener("hashchange", () => { sheets.slice().forEach((sh) => sh.close()); render(); window.scrollTo(0, 0); });
 window.addEventListener("scroll", () => {
   const tb = $(".topbar");
   if (tb) tb.classList.toggle("scrolled", window.scrollY > 36);
@@ -1354,7 +1364,10 @@ async function listAdd() {
     const btn = $("#lread", s.el); btn.disabled = true; btn.innerHTML = `<span class="spinner"></span> Reading…`;
     const fd = formWithPhotos(photos.map((p) => p.blob), { text: ta.value });
     let res;
-    try { res = await POST("api/parse-list", fd); } catch (e) { fail(e); btn.disabled = false; btn.innerHTML = `${I.sparkle} Read list`; return; }
+    try {
+      const start = await POST("api/parse-list", fd);
+      res = await pollJob(start.job, (d, t) => { if (t > 1) btn.innerHTML = `<span class="spinner"></span> Reading part ${Math.min(d + 1, t)} of ${t}…`; });
+    } catch (e) { fail(e); btn.disabled = false; btn.innerHTML = `${I.sparkle} Read list`; return; }
     btn.disabled = false; btn.innerHTML = `${I.sparkle} Read again`;
     if (res.error && !res.items.length) { toast(res.error); return; }
     review(res);
@@ -1369,7 +1382,7 @@ async function listAdd() {
       const locs = await locations();
       const n = rows.filter((r) => r.mode !== "skip").length;
       out.innerHTML = `
-        ${res.error ? `<div class="help" style="color:var(--orange);margin-top:12px">${esc(res.error)} Read line by line instead.</div>` : ""}
+        ${res.error ? `<div class="help" style="color:var(--orange);margin-top:12px">${esc(res.error)}</div>` : ""}
         <div class="section-h"><span>${rows.length} part${rows.length === 1 ? "" : "s"} found${res.ai ? "" : " (basic reading)"}</span></div>
         <div class="form"><div class="group"><div class="field"><label>Put in</label><select id="lloc">${locationOptions(locs, presetLocation)}</select></div></div></div>
         <div class="group" style="margin-top:10px">${rows.map((r, i) => `
@@ -1762,11 +1775,13 @@ async function autoCategorize() {
   const s = openSheet({
     title: "Auto-categorize", full: true,
     left: { label: "Cancel", fn: () => s.close() },
-    body: `<div class="status" style="padding-top:40px"><span class="spinner"></span> Sorting your parts…</div>`,
+    body: `<div class="status" style="padding-top:40px"><span class="spinner"></span> <span id="catprog">Sorting your parts…</span></div>`,
   });
   let res;
-  try { res = await POST("api/ai/categorize", { scope }); }
-  catch (e) { s.content.innerHTML = `<div class="empty">${I.alert}<div>${esc(e.message)}</div></div>`; return; }
+  try {
+    res = await POST("api/ai/categorize", { scope });
+    if (res.job) res = await pollJob(res.job, (d, t) => { const el = $("#catprog", s.el); if (el && t) el.textContent = `Sorting your parts… ${Math.round((d / t) * 100)}%`; });
+  } catch (e) { s.content.innerHTML = `<div class="empty">${I.alert}<div>${esc(e.message)}</div></div>`; return; }
   const props = res.proposals.map((p) => ({ ...p, on: true }));
   if (!props.length) { s.content.innerHTML = `<div class="empty">${I.tag}<div>Everything is already categorized nicely.</div></div>`; return; }
   const draw = () => {

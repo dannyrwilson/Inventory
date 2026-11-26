@@ -3,6 +3,7 @@ import base64
 import io
 import json
 import logging
+import time
 
 from PIL import Image, ImageOps
 
@@ -204,6 +205,7 @@ class Identifier:
         self.api_key = (api_key or "").strip()
         self.model = (model or "").strip() or DEFAULT_MODELS[self.provider]
         self._client = None
+        self._reasoning_ok = True
 
     @property
     def enabled(self):
@@ -254,9 +256,9 @@ class Identifier:
         if categories:
             prompt += "\nCategory list:\n" + "\n".join(categories)
         if text.strip():
-            prompt += "\n\nThe list:\n" + text.strip()[:20000]
+            prompt += "\n\nThe list:\n" + text.strip()
         data, model = self._call(list(image_paths)[:4], prompt, LIST_SYSTEM, LIST_SCHEMA, "parts_list",
-                                 max_side=2048, timeout=300.0)
+                                 max_side=2048, timeout=240.0)
         return data.get("items") or [], model
 
     def categorize(self, items, categories=()):
@@ -268,7 +270,7 @@ class Identifier:
             lines.append(f'{it["id"]}: {it["name"]}' + (f" ({extra[:200]})" if extra else ""))
         text = ("Category list:\n" + ("\n".join(categories) if categories else "(none yet)") +
                 "\n\nItems:\n" + "\n".join(lines))
-        data, _ = self._call([], text, CATEGORY_SYSTEM, CATEGORY_SCHEMA, "categories", timeout=180.0)
+        data, _ = self._call([], text, CATEGORY_SYSTEM, CATEGORY_SCHEMA, "categories", timeout=150.0)
         valid = {it["id"] for it in items}
         return {a["id"]: a["category"].strip() for a in data.get("assignments", [])
                 if a.get("id") in valid and a.get("category", "").strip()}
@@ -283,12 +285,27 @@ class Identifier:
                     "image_url": "data:image/jpeg;base64," + prepare_image(p, max_side)}
                    for p in image_paths]
         content.append({"type": "input_text", "text": text})
-        resp = self.client.with_options(timeout=timeout).responses.create(
+        import openai
+        kwargs = dict(
             model=self.model,
             instructions=system,
             input=[{"role": "user", "content": content}],
             text={"format": {"type": "json_schema", "name": name, "schema": schema, "strict": True}},
         )
+        client = self.client.with_options(timeout=timeout)
+        t0 = time.time()
+        if self._reasoning_ok:
+            try:
+                # reading labels / sorting parts doesn't need deep thinking; low is several times faster
+                resp = client.responses.create(reasoning={"effort": "low"}, **kwargs)
+            except openai.BadRequestError as e:
+                if "reasoning" not in str(e).lower():
+                    raise
+                self._reasoning_ok = False  # non-reasoning model (e.g. gpt-4.1)
+                resp = client.responses.create(**kwargs)
+        else:
+            resp = client.responses.create(**kwargs)
+        log.info("AI %s: %s in %.1fs (status %s)", name, resp.model, time.time() - t0, getattr(resp, "status", "?"))
         if getattr(resp, "status", "completed") == "incomplete":
             raise RuntimeError("The AI response was cut off; try again.")
         out = resp.output_text

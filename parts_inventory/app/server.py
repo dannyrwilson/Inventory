@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 from flask import Flask, Response, abort, jsonify, request, send_from_directory
 from PIL import Image, ImageOps
@@ -240,6 +241,39 @@ def get_or_create_location_path(path):
     return parent
 
 
+# ------------------------------------------------------- background jobs
+# Long AI work runs here and the app polls for progress, so nothing waits on one
+# long request (Home Assistant's ingress proxy drops those).
+JOBS = {}
+AI_WORKERS = 4
+
+
+def start_job(fn, *args):
+    jid = uuid.uuid4().hex[:12]
+    job = {"id": jid, "status": "running", "done": 0, "total": 0, "result": None, "error": None,
+           "started": time.time()}
+    JOBS[jid] = job
+    for k in [k for k, v in JOBS.items() if time.time() - v["started"] > 3600]:
+        JOBS.pop(k, None)
+
+    def run():
+        try:
+            job["result"] = fn(job, *args)
+            job["status"] = "done"
+        except Exception as e:
+            log.exception("Job failed")
+            job["error"] = ai.friendly_error(e)
+            job["status"] = "error"
+    threading.Thread(target=run, daemon=True).start()
+    return jid
+
+
+@app.get("/api/jobs/<jid>")
+def get_job(jid):
+    job = JOBS.get(jid)
+    return jsonify(job) if job else err("Job not found (the add-on may have restarted)", 404)
+
+
 # ------------------------------------------------------ default categories
 
 
@@ -273,17 +307,34 @@ if not db.one("SELECT value FROM meta WHERE key='seeded_taxonomy'"):
 
 
 # ------------------------------------------------------- auto-categorize
-def categorize_items(ids):
-    """Ask the AI for categories for the given item ids. Returns {id: category_name}."""
-    out = {}
+def categorize_items(ids, job=None):
+    """Ask the AI for categories, 40 items per request, 4 requests at a time.
+    Returns {id: category_path}. A failed chunk is skipped (and logged) unless all fail."""
     cats = category_paths()
-    for i in range(0, len(ids), 80):
-        chunk = ids[i:i + 80]
+    chunks = [ids[i:i + 40] for i in range(0, len(ids), 40)]
+    if job is not None:
+        job["total"] = len(chunks)
+
+    def one(chunk):
         rows = db.q("SELECT id, name, description, part_number, manufacturer, tags FROM items "
                     "WHERE id IN (%s)" % ",".join("?" * len(chunk)), chunk)
-        got = identifier.categorize(rows, cats)
-        out.update(got)
-        cats = sorted(set(cats) | set(got.values()), key=str.lower)  # keep later chunks consistent
+        try:
+            return identifier.categorize(rows, cats), None
+        except Exception as e:
+            log.warning("Categorize chunk failed: %s", ai.friendly_error(e))
+            return {}, e
+        finally:
+            if job is not None:
+                job["done"] += 1
+
+    out, errors = {}, []
+    with ThreadPoolExecutor(AI_WORKERS) as pool:
+        for got, e in pool.map(one, chunks):
+            out.update(got)
+            if e:
+                errors.append(e)
+    if errors and not out:
+        raise errors[0]
     return out
 
 
@@ -321,11 +372,13 @@ class AutoCategorizer:
                                              "ORDER BY id DESC LIMIT 200") if r["id"] not in self.tried]
                 if not ids:
                     continue
-                self.tried.update(ids)
-                n = apply_categories(categorize_items(ids))
-                log.info("Auto-categorized %d item(s)", n)
+                got = categorize_items(ids)
+                # only items the AI actually answered for are "tried"; failures retry next time
+                self.tried.update(got.keys())
+                n = apply_categories(got)
+                log.info("Auto-categorized %d of %d item(s)", n, len(ids))
             except Exception as e:
-                log.warning("Auto-categorize failed: %s", ai.friendly_error(e))
+                log.warning("Auto-categorize failed (will retry on the next change): %s", ai.friendly_error(e))
 
 
 auto_cat = AutoCategorizer()
@@ -899,14 +952,14 @@ def ai_categorize():
         return err("AI is not configured. Add an OpenAI API key in the add-on configuration.")
     scope = body().get("scope", "uncategorized")
     sql = "SELECT id FROM items" + ("" if scope == "all" else " WHERE category_id IS NULL") + " ORDER BY id"
-    ids = [r["id"] for r in db.q(sql)][:800]
+    ids = [r["id"] for r in db.q(sql)][:2000]
     if not ids:
         return jsonify({"proposals": []})
-    try:
-        got = categorize_items(ids)
-    except Exception as e:
-        log.exception("Categorize failed")
-        return err(ai.friendly_error(e), 502)
+    return jsonify({"job": start_job(_categorize_job, ids)})
+
+
+def _categorize_job(job, ids):
+    got = categorize_items(ids, job)
     rows = {r["id"]: r for r in db.q(db.item_row_sql() + " WHERE i.id IN (%s)" % ",".join("?" * len(ids)), ids)}
     props = []
     for item_id, cat in got.items():
@@ -914,7 +967,7 @@ def ai_categorize():
         if r and (r["category_name"] or "").lower() != cat.lower():
             props.append({"id": item_id, "name": r["name"], "photo": r["photo"],
                           "current": r["category_name"], "category": cat})
-    return jsonify({"proposals": props})
+    return {"proposals": props, "checked": len(got), "asked": len(ids)}
 
 
 @app.post("/api/ai/categorize/apply")
@@ -999,30 +1052,74 @@ def parse_list():
     photo_rows = store_uploads() if request.files else []
     if not text.strip() and not photo_rows:
         return err("Paste a list or add a photo of one")
-    result = {"photos": photo_rows, "items": [], "ai": False}
-    if identifier.enabled:
-        try:
-            items, model = identifier.parse_list(text, [os.path.join(PHOTO_DIR, p["filename"]) for p in photo_rows],
-                                                 category_paths())
-            result.update(items=items, ai=True, model=model)
-        except Exception as e:
-            log.exception("List parse failed")
-            result["error"] = ai.friendly_error(e)
-            if not text.strip():
-                return jsonify(result)
-            result["items"] = parse_list_locally(text)
-    else:
-        if not text.strip():
-            result["error"] = "Reading a photo of a list needs AI. Add an OpenAI key, or paste the list as text."
-            return jsonify(result)
+    if not identifier.enabled and not text.strip():
+        return err("Reading a photo of a list needs AI. Add an OpenAI key, or paste the list as text.")
+    paths = [os.path.join(PHOTO_DIR, p["filename"]) for p in photo_rows]
+    return jsonify({"job": start_job(_parse_list_job, text, paths), "photos": photo_rows})
+
+
+def _text_chunks(text, max_lines=40, max_chars=3000):
+    lines = [l for l in text.splitlines() if l.strip()]
+    chunks, cur, size = [], [], 0
+    for l in lines:
+        if cur and (len(cur) >= max_lines or size + len(l) > max_chars):
+            chunks.append("\n".join(cur))
+            cur, size = [], 0
+        cur.append(l)
+        size += len(l) + 1
+    if cur:
+        chunks.append("\n".join(cur))
+    return chunks
+
+
+def _parse_list_job(job, text, paths):
+    """Big lists are split into ~40-line chunks read 4 at a time; each photo is its own request.
+    A chunk the AI can't read falls back to the basic line reader, so nothing is lost."""
+    result = {"items": [], "ai": identifier.enabled, "errors": []}
+    if not identifier.enabled:
         result["items"] = parse_list_locally(text)
+    else:
+        cats = category_paths()
+        tasks = [("text", c) for c in _text_chunks(text)] + [("photo", p) for p in paths]
+        job["total"] = len(tasks)
+
+        def one(task):
+            kind, val = task
+            try:
+                if kind == "text":
+                    items, _ = identifier.parse_list(val, [], cats)
+                else:
+                    items, _ = identifier.parse_list("", [val], cats)
+                return items, None
+            except Exception as e:
+                log.warning("List chunk failed: %s", ai.friendly_error(e))
+                return (parse_list_locally(val) if kind == "text" else []), ai.friendly_error(e)
+            finally:
+                job["done"] += 1
+
+        with ThreadPoolExecutor(AI_WORKERS) as pool:
+            for items, e in pool.map(one, tasks):
+                result["items"] += items
+                if e and e not in result["errors"]:
+                    result["errors"].append(e)
+        # the same part split across chunks -> one row with the quantities added
+        merged = {}
+        for it in result["items"]:
+            key = dupes.norm_name(it.get("name"))
+            if key in merged:
+                merged[key]["quantity"] = (merged[key].get("quantity") or 0) + (it.get("quantity") or 0)
+            else:
+                merged[key] = it
+        result["items"] = list(merged.values())
     # flag parts you already have (they get their stock topped up instead)
     for it in result["items"]:
         ex = dup.find_existing({"name": it.get("name"), "part_number": it.get("part_number")})
         if ex:
-            r = db.one("SELECT id, name, quantity, unit FROM items WHERE id=?", (ex,))
-            it["match"] = r
-    return jsonify(result)
+            it["match"] = db.one("SELECT id, name, quantity, unit FROM items WHERE id=?", (ex,))
+    if result["errors"]:
+        result["error"] = "Some of the list couldn't be read by AI (" + result["errors"][0] + \
+                          "); those lines were read line by line instead."
+    return result
 
 
 # label printer (NIIMBOT D11 / D11_H via the Pi's Bluetooth)

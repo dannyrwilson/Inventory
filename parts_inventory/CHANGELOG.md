@@ -1,3 +1,11 @@
+## 1.7.1
+- Fix: large pasted lists and "Auto-categorize" timing out. Long AI work now runs in the background
+  with a progress bar, split into small chunks processed 4 at a time (no more 20,000-character cap).
+- Faster AI: OpenAI requests use low reasoning effort (falls back automatically on models without it).
+- Fix: background auto-categorize retries items after a failure instead of skipping them for good.
+- Fix: navigating (e.g. back gesture) closes any open sheet instead of leaving it on top.
+- AI calls are logged with timings in the add-on log.
+
 ## 1.7.0
 - Add from notes / list: paste a parts list or photograph a written one; AI (or a basic line reader
   without AI) turns it into items with quantities. Review, edit quantities, then add; parts you

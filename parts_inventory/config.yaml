@@ -1,5 +1,5 @@
 name: Parts Inventory
-version: "1.7.0"
+version: "1.7.1"
 slug: parts_inventory
 description: Photo-first inventory for all your parts. SQLite, search, linked items, AI photo identification.
 url: https://github.com/dannyrwilson/Inventory
