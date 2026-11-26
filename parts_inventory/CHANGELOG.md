@@ -1,3 +1,8 @@
+## 1.7.2
+- Safer CSV import: an id only updates an existing item when the name matches (ids from another
+  copy or an old export can no longer overwrite a different part); blank quantity imports as 1;
+  categories from another scheme no longer create stray groups (kept as tags, item auto-categorized).
+
 ## 1.7.1
 - Fix: large pasted lists and "Auto-categorize" timing out. Long AI work now runs in the background
   with a progress bar, split into small chunks processed 4 at a time (no more 20,000-character cap).

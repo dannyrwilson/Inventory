@@ -1651,7 +1651,7 @@ route(/^\/more$/, async (view) => {
     const fd = new FormData(); fd.append("file", f);
     toast("Importing…");
     const r = await POST("api/import.csv", fd).catch(fail);
-    if (r) { invalidate(); toast(`Imported ${r.created} new, ${r.updated} updated${r.merged ? `, ${r.merged} merged into existing` : ""}${r.errors.length ? `, ${r.errors.length} errors` : ""}`); if (r.errors.length) console.warn(r.errors); }
+    if (r) { invalidate(); toast(`Imported ${r.created} new, ${r.updated} updated${r.merged ? `, ${r.merged} merged into existing` : ""}${r.to_categorize ? `, ${r.to_categorize} being sorted into categories` : ""}${r.errors.length ? `, ${r.errors.length} errors` : ""}`); if (r.errors.length) console.warn(r.errors); }
   };
 }, "more");
 

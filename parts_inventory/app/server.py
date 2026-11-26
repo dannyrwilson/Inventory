@@ -1247,34 +1247,49 @@ def import_csv():
         return err("No file")
     text = f.read().decode("utf-8-sig", errors="replace")
     reader = csv.DictReader(io.StringIO(text))
-    created = updated = merged = 0
+    created = updated = merged = sorted_later = 0
     errors = []
+    groups = {r["name"].lower() for r in db.q("SELECT name FROM categories WHERE parent_id IS NULL")}
     for n, row in enumerate(reader, start=2):
         row = {(k or "").strip().lower(): (v or "").strip() for k, v in row.items()}
         try:
             data = {k: row[k] for k in ITEM_FIELDS if k in row and row[k] != ""}
-            if row.get("category"):
-                data["category_id"] = get_or_create_category(row["category"])
+            cat = row.get("category")
+            if cat:
+                parts = split_category(cat)
+                if parts and parts[0].lower() in groups:
+                    data["category_id"] = get_or_create_category(cat)
+                else:
+                    # a category from another scheme: don't grow a stray group. Keep its words as
+                    # tags (still searchable) and let auto-categorize file the item into the tree.
+                    words = [w for w in re.split(r"[^a-z0-9]+", " ".join(parts).lower()) if len(w) > 1]
+                    data["tags"] = ",".join(t for t in [data.get("tags", "")] + words if t)
+                    sorted_later += 1
             if row.get("location"):
                 data["location_id"] = get_or_create_location_path(row["location"])
             if "favorite" in data:
                 data["favorite"] = data["favorite"] not in ("0", "false", "no")
             rid = row.get("id")
-            if rid and rid.isdigit() and db.one("SELECT id FROM items WHERE id=?", (int(rid),)):
+            target = db.one("SELECT id, name FROM items WHERE id=?", (int(rid),)) if rid and rid.isdigit() else None
+            # an id only updates when it's clearly the same item: ids from another copy of the
+            # inventory (or rows added since an export) must never overwrite a different part
+            if target and (not data.get("name") or dupes.norm_name(target["name"]) == dupes.norm_name(data["name"])):
                 db.update_item(int(rid), data)
                 updated += 1
+                continue
+            existing = dup.find_existing(data)
+            if existing:
+                db.adjust(existing, float(data.get("quantity") or 0), "Imported (merged duplicate)")
+                db.reindex(existing)
+                merged += 1
             else:
-                existing = dup.find_existing(data)
-                if existing:
-                    db.adjust(existing, float(data.get("quantity") or 0), "Imported (merged duplicate)")
-                    db.reindex(existing)
-                    merged += 1
-                else:
-                    db.create_item(data, reason="Imported")
-                    created += 1
+                data.setdefault("quantity", 1)  # no quantity recorded: you have at least one
+                db.create_item(data, reason="Imported")
+                created += 1
         except Exception as e:
             errors.append(f"Row {n}: {e}")
-    return jsonify({"created": created, "updated": updated, "merged": merged, "errors": errors[:50]})
+    return jsonify({"created": created, "updated": updated, "merged": merged,
+                    "to_categorize": sorted_later, "errors": errors[:50]})
 
 
 @app.errorhandler(400)
