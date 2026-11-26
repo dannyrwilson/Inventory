@@ -11,7 +11,9 @@ Raspberry Pi (HA OS) and shows up in the HA sidebar.
 - 🔎 **Fast search**: SQLite full-text search across names, part numbers (`7805` finds `LM7805`), tags, notes, categories and locations
 - 🔗 **Linked items**: part of / has part, compatible with, replacement for, accessory, requires, related
 - 📍 **Nested locations**: Garage › Shelf A › Bin 3, with photos of each spot
-- 🏷️ **QR labels**: print labels for items and bins, then scan them in the app to jump straight to that item
+- 🏷️ **Label printer**: prints QR labels on a **NIIMBOT D11 / D11_H** straight from the Pi over Bluetooth (works from any phone), or on paper. Scan a label in the app to jump to that item
+- ⧉ **No duplicates**: adding something you already have offers to add stock instead; existing duplicates are hidden in a Duplicates tab with one-tap merge
+- 🖼️ **Scan many photos at once**: pick a batch of photos (one part each) and add them all after a quick review
 - ➕➖ **Quick stock steppers**, low-stock alerts, history and activity log
 - 📱 **Feels native**: iOS-style UI, dark mode, swipe-to-dismiss sheets, haptics, installable PWA
 - 💾 **SQLite in `/data`**, so it's included in Home Assistant backups. CSV import and export, plus a full JSON export
@@ -48,6 +50,13 @@ Restart the add-on after changing options. Photos are only sent to the AI provid
 On the **Configuration** tab, under **Network**, set a host port for `8099/tcp`. **Set a `password`
 first**, because direct access bypasses Home Assistant's login. Then open `http://<pi-ip>:<port>/`.
 Access through the HA sidebar never asks for this password.
+
+## Label printer (NIIMBOT D11 / D11_H)
+
+1. Update the add-on. The update adds Bluetooth access (`host_dbus`), so **restart the add-on** afterwards.
+2. Turn the printer on near the Pi (within about 10 m). If it's connected to the NIIMBOT phone app, close that app first, because the printer only talks to one device at a time.
+3. In the app go to **More → Label printer → Find printer**, pick it, set your label length (e.g. 40 mm for 12×40 mm rolls), and use **Print test label**.
+4. On any item, tap **Label**, then **Print on D11…**. From a location you can print labels for everything in it.
 
 ## Using it
 

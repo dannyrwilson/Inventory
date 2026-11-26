@@ -1,3 +1,9 @@
+## 1.6.0
+- NIIMBOT D11 / D11_H label printing from the Pi over Bluetooth (ported from Distill Log; verified
+  against its recorded protocol transcripts). Label length + firmware settings, live preview, test print.
+- Labels: long names wrap onto two lines; part number or category on the second line; QR code to scan.
+- Bigger photo previews while scanning, tap any preview to view full screen and zoom.
+
 ## 1.5.0
 - Scan multiple photos at once: pick many photos (one part each), AI identifies them in parallel,
   review the list and add them all (stock 1 each, existing items get +1 instead of duplicates).

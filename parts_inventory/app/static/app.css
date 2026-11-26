@@ -262,7 +262,7 @@ img { display: block; }
 
 /* snap / AI */
 .snap-preview { margin: 0 16px; border-radius: var(--radius); overflow: hidden; position: relative; background: #000; }
-.snap-preview img { width: 100%; max-height: 46vh; object-fit: contain; }
+.snap-preview img { width: 100%; max-height: 60vh; object-fit: contain; cursor: zoom-in; }
 .scanning::after {
   content: ""; position: absolute; left: 0; right: 0; height: 30%; top: -30%;
   background: linear-gradient(to bottom, transparent, rgba(10,132,255,.45), transparent);
@@ -349,3 +349,17 @@ img { display: block; }
 
 .chip.dupchip { background: rgba(255,149,0,.16); color: var(--orange); }
 .dupitem .check { margin-top: 16px; }
+
+/* bigger scan previews + zoom */
+.zoomhint { position: absolute; right: 10px; bottom: 10px; background: rgba(0,0,0,.55); color: #fff; font-size: 12px; padding: 3px 9px; border-radius: 99px; pointer-events: none; }
+.pic.big { width: 96px; height: 96px; border-radius: 12px; cursor: zoom-in; }
+.row.thumb .pic.big + .main { min-height: 96px; display: flex; flex-direction: column; justify-content: center; }
+.lightbox { position: fixed; inset: 0; z-index: 300; background: #000; opacity: 0; transition: opacity .2s; }
+.lightbox.show { opacity: 1; }
+.lbscroll { position: absolute; inset: 0; overflow: auto; display: flex; touch-action: pinch-zoom pan-x pan-y; }
+.lbscroll img { margin: auto; max-width: 100%; max-height: 100%; object-fit: contain; }
+.lbscroll img.zoom { max-width: none; max-height: none; width: 250%; }
+.lbclose { position: absolute; top: calc(var(--safe-t) + 12px); right: 14px; width: 38px; height: 38px; border-radius: 50%; border: 0; background: rgba(255,255,255,.18); color: #fff; font-size: 18px; }
+/* label preview */
+.labelprev { margin: 0 16px; background: var(--bg2); border-radius: var(--radius); padding: 16px; display: flex; justify-content: center; }
+.labelprev img { max-width: 100%; image-rendering: pixelated; border: 1px solid var(--sep); border-radius: 4px; background: #fff; }

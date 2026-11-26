@@ -275,6 +275,32 @@ async function decodeCode(canvas) {
   return null;
 }
 
+// Full-screen photo viewer: tap any scan preview; pinch or double-tap to zoom.
+function lightbox(src) {
+  const el = document.createElement("div");
+  el.className = "lightbox";
+  el.innerHTML = `<div class="lbscroll"><img src="${src}" alt=""></div><button class="lbclose" aria-label="Close">✕</button>`;
+  document.body.append(el);
+  requestAnimationFrame(() => el.classList.add("show"));
+  const close = () => { el.classList.remove("show"); setTimeout(() => el.remove(), 200); };
+  $(".lbclose", el).onclick = close;
+  const img = $("img", el);
+  let zoomed = false, last = 0;
+  img.onclick = (e) => {
+    const now = Date.now();
+    if (now - last < 300 || e.detail === 2) {
+      zoomed = !zoomed; img.classList.toggle("zoom", zoomed);
+      if (zoomed) { const sc = $(".lbscroll", el); sc.scrollLeft = (img.offsetWidth - sc.clientWidth) / 2; sc.scrollTop = (img.offsetHeight - sc.clientHeight) / 2; }
+    }
+    last = now;
+  };
+  $(".lbscroll", el).onclick = (e) => { if (e.target === e.currentTarget && !zoomed) close(); };
+}
+document.addEventListener("click", (e) => {
+  const img = e.target.closest(".snap-preview img, img.zoomable");
+  if (img) { e.preventDefault(); e.stopPropagation(); lightbox(img.dataset.full || img.src); }
+}, true);
+
 // ------------------------------------------------------------------ fragments
 const picHTML = (photo, cls = "pic") => photo ? `<img class="${cls}" loading="lazy" src="${thumb(photo)}" alt="">` : `<div class="${cls}">${I.box}</div>`;
 function itemRow(it, opts = {}) {
@@ -585,7 +611,7 @@ route(/^\/item\/(\d+)$/, async (view, [id]) => {
   const link = (e) => { e && e.preventDefault(); linkFlow(it); };
   $("#a-link").onclick = link; $("#addlink").onclick = link;
   const al2 = $("#addlink2"); if (al2) al2.onclick = link;
-  $("#a-label").onclick = () => printLabels([{ code: `INV:${it.id}`, title: it.name, sub: [it.part_number, it.location_path].filter(Boolean).join(" · ") }]);
+  $("#a-label").onclick = () => printLabels([{ code: `INV:${it.id}`, title: it.name, sub: it.part_number || (it.category_name || "").split(" › ").pop() }]);
   // suggest owned parts that match "works with" entries
   if (it.compatible.length) {
     const linked = new Set(it.links.map((l) => l.id));
@@ -741,7 +767,7 @@ async function itemForm(item = {}, opts = {}) {
     }
   }
   const drawStrip = () => {
-    $("#strip", s.el).innerHTML = photos.map((p, i) => `<div class="ph"><img src="${thumb(p.filename)}"><button type="button" class="x" data-i="${i}">✕</button></div>`).join("") +
+    $("#strip", s.el).innerHTML = photos.map((p, i) => `<div class="ph"><img class="zoomable" src="${thumb(p.filename)}" data-full="${full(p.filename)}"><button type="button" class="x" data-i="${i}">✕</button></div>`).join("") +
       `<button type="button" class="add" id="addph">${I.camera}</button>`;
     $("#addph", s.el).onclick = async () => {
       const files = await choosePhotos();
@@ -953,7 +979,7 @@ async function snap(source) {
   const s = openSheet({
     title: cfg.ai_enabled ? "Identify" : "New from Photo", full: true,
     left: { label: "Cancel", fn: () => s.close() },
-    body: `<div class="snap-preview ${cfg.ai_enabled ? "scanning" : ""}" id="sp"><img src="${previewURL}"></div><div id="out"><div class="status"><span class="spinner"></span> ${cfg.ai_enabled ? "Identifying…" : "Uploading…"}</div></div>`,
+    body: `<div class="snap-preview ${cfg.ai_enabled ? "scanning" : ""}" id="sp"><img src="${previewURL}"><span class="zoomhint">Tap to zoom</span></div><div id="out"><div class="status"><span class="spinner"></span> ${cfg.ai_enabled ? "Identifying…" : "Uploading…"}</div></div>`,
     onClose: () => setTimeout(() => URL.revokeObjectURL(previewURL), 120000),
   });
   const out = $("#out", s.el);
@@ -1084,7 +1110,7 @@ async function boxScan(presetLocation, existingPhotos, existingPreview) {
   const s = openSheet({
     title: "Scan Box", full: true,
     left: { label: "Cancel", fn: () => s.close() },
-    body: `<div class="snap-preview scanning" id="sp"><img src="${previewURL}" style="max-height:28vh"></div>
+    body: `<div class="snap-preview scanning" id="sp"><img src="${previewURL}" style="max-height:44vh"><span class="zoomhint">Tap to zoom</span></div>
       <div id="out"><div class="status"><span class="spinner"></span> Reading every label…</div>
       <div class="help" style="text-align:center">Big boxes can take up to a minute.</div></div>`,
     onClose: () => { if (!existingPreview) URL.revokeObjectURL(previewURL); },
@@ -1198,15 +1224,15 @@ async function multiScan(files) {
       <div class="group" style="margin-top:12px">${rows.map((r, i) => `
         <div class="row thumb brow ${r.mode === "skip" || r.state !== "ok" ? "off" : ""}">
           ${r.state === "ok" ? `<button class="check ${r.mode === "skip" ? "" : "on"}" data-check="${i}">✓</button>` : `<span style="width:26px"></span>`}
-          <img class="pic" src="${r.preview}">
+          <img class="pic big zoomable" src="${r.preview}">
           <div class="main">
             ${r.state === "busy" ? `<div class="t"><span class="spinner" style="width:16px;height:16px"></span> Identifying…</div>`
               : r.state === "err" ? `<div class="t" style="color:var(--red)">${esc(r.error)}</div>`
               : `<input class="bname" data-name="${i}" value="${esc(r.name)}">
                  <div class="s">${esc([r.category, r.compat && r.compat.length ? "works with " + r.compat.slice(0, 3).join(", ") : ""].filter(Boolean).join(" · "))}</div>
-                 ${r.match ? `<div class="s" style="color:var(--orange)">Already have: ${esc(r.match.name)} (${fmt(r.match.quantity)})</div>` : ""}`}
+                 ${r.match ? `<div class="s" style="color:var(--orange)">Already have: ${esc(r.match.name)} (${fmt(r.match.quantity)})</div>` : ""}
+                 <div><button class="pill ${r.mode}" data-mode="${i}">${modeLabel[r.mode]}</button></div>`}
           </div>
-          ${r.state === "ok" ? `<button class="pill ${r.mode}" data-mode="${i}">${modeLabel[r.mode]}</button>` : ""}
         </div>`).join("")}
         <button class="row center" id="madd">${I.plus} Add more photos</button></div>
       <div style="height:90px"></div>
@@ -1349,7 +1375,7 @@ route(/^\/location\/(\d+)$/, async (view, [id]) => {
     } else if (v === "label") {
       printLabels([{ code: `LOC:${id}`, title: loc.name, sub: parentPath }]);
     } else if (v === "labels") {
-      printLabels(items.items.map((i) => ({ code: `INV:${i.id}`, title: i.name, sub: [i.part_number, i.location_path].filter(Boolean).join(" · ") })));
+      printLabels(items.items.map((i) => ({ code: `INV:${i.id}`, title: i.name, sub: i.part_number || (i.category_name || "").split(" › ").pop() })));
     } else if (v === "del") {
       if (await confirmDanger("Delete location", "Items and sub-locations inside will move up one level.")) {
         await DEL(`api/locations/${id}`).catch(fail); invalidate(); history.back();
@@ -1359,8 +1385,31 @@ route(/^\/location\/(\d+)$/, async (view, [id]) => {
 }, "locations");
 
 // ------------------------------------------------------------------ labels
-function printLabels(labels) {
+async function printLabels(labels) {
   if (!labels.length) return toast("Nothing to print");
+  const pr = await GET("api/printer").catch(() => ({}));
+  const n = labels.length;
+  const v = await actionSheet([
+    ...(pr.address ? [{ label: `Print ${n} on ${pr.name || "Niimbot"}`, value: "niimbot", icon: I.qr }]
+      : [{ label: "Set up Niimbot printer…", value: "setup", icon: I.qr }]),
+    { label: "Print on paper (sheet of labels)", value: "paper", icon: I.tag },
+  ], `${n} label${n === 1 ? "" : "s"}`);
+  if (v === "setup") { location.hash = "#/printer"; return; }
+  if (v === "niimbot") return printNiimbot(labels);
+  if (v === "paper") return printPaper(labels);
+}
+
+async function printNiimbot(labels) {
+  toast(`Printing ${labels.length} label${labels.length === 1 ? "" : "s"}…`);
+  try {
+    const r = await POST("api/printer/print", { labels: labels.map((l) => ({ title: l.title, sub: l.sub || "", code: l.code })) });
+    haptic(20); toast(`Printed ${r.printed} on ${r.model}`);
+  } catch (e) {
+    toast(e.message, { label: "Settings", fn: () => (location.hash = "#/printer") });
+  }
+}
+
+function printPaper(labels) {
   let root = $("#print-root");
   if (!root) { root = document.createElement("div"); root.id = "print-root"; document.body.append(root); }
   root.innerHTML = labels.map((l) => `<div class="label"><img src="api/qr?data=${encodeURIComponent(l.code)}"><div><b>${esc(l.title)}</b><small>${esc(l.sub || "")}</small><br><small>${esc(l.code)}</small></div></div>`).join("");
@@ -1370,6 +1419,58 @@ function printLabels(labels) {
   imgs.forEach((i) => { i.onload = i.onerror = () => { if (++n === imgs.length) go(); }; });
   toast("Preparing labels…");
 }
+
+// ------------------------------------------------------------------ label printer settings
+route(/^\/printer$/, async (view) => {
+  let pr = await GET("api/printer");
+  const sample = { title: "M3 x 10mm socket head cap screw", sub: "Screws", code: "INV:123" };
+  const previewURL = () => `api/printer/preview.png?${new URLSearchParams({ ...sample, mm: pr.label_mm, t: Date.now() })}`;
+  const draw = () => {
+    view.innerHTML = `<div class="page">${topbar({ title: "Label printer", back: "More" })}
+      <div class="largetitle">Label printer</div>
+      <div class="subtitle">NIIMBOT D11 / D11_H, printed by the Pi over Bluetooth. Keep the printer on and within about 10 m of the Pi.</div>
+      ${pr.available ? "" : `<div class="help" style="color:var(--red);margin-bottom:10px">Bluetooth support isn't available in this build. Update the add-on.</div>`}
+      <div class="section-h">Printer</div>
+      <div class="group">
+        <div class="row"><div class="main"><div class="t">${pr.address ? esc(pr.name || "NIIMBOT") : "Not set up"}</div><div class="s">${pr.address ? esc(pr.address) : "Turn the printer on, then search"}</div></div>
+          <button class="btn small ${pr.address ? "gray" : ""}" id="find">${pr.address ? "Change" : "Find printer"}</button></div>
+      </div>
+      <div class="section-h">Labels</div>
+      <div class="form"><div class="group">
+        <div class="field"><label>Label length</label><select id="mm">${[20, 25, 30, 35, 40, 50, 60, 70, 80].map((m) => `<option value="${m}" ${+pr.label_mm === m ? "selected" : ""}>${m} mm</option>`).join("")}</select></div>
+        <div class="field"><label>Firmware</label><select id="task"><option value="auto" ${pr.task !== "legacy" ? "selected" : ""}>Automatic</option><option value="legacy" ${pr.task === "legacy" ? "selected" : ""}>Older D11 firmware</option></select></div>
+      </div></div>
+      <div class="help">Match the length to your label roll (e.g. 12×40 mm rolls → 40 mm). Pick “Older D11 firmware” only if labels start but never finish.</div>
+      <div class="section-h">Preview</div>
+      <div class="labelprev"><img id="prev" src="${previewURL()}" alt="Label preview"></div>
+      <div class="btnrow" style="margin-top:14px"><button class="btn" id="test" ${pr.address ? "" : "disabled"}>${I.qr} Print test label</button></div>
+      <div class="help" style="margin-top:12px">Scan a printed label with the camera button (or the QR icon in search) to jump straight to that item.</div>
+    </div>`;
+    $("#find").onclick = findPrinter;
+    $("#mm").onchange = async (e) => { pr = await PUT("api/printer", { label_mm: +e.target.value }).catch(fail) || pr; $("#prev").src = previewURL(); };
+    $("#task").onchange = async (e) => { pr = await PUT("api/printer", { task: e.target.value }).catch(fail) || pr; };
+    $("#test").onclick = () => printNiimbot([sample]);
+  };
+  const findPrinter = async () => {
+    const s = openSheet({ title: "Find printer", left: { label: "Cancel", fn: () => s.close() },
+      body: `<div class="status" style="padding:30px"><span class="spinner"></span> Searching for NIIMBOT printers…</div>` });
+    let r;
+    try { r = await POST("api/printer/scan"); }
+    catch (e) { s.content.innerHTML = `<div class="empty">${I.alert}<div>${esc(e.message)}</div></div>`; return; }
+    if (!r.devices.length) {
+      s.content.innerHTML = `<div class="empty">${I.qr}<div>No printer found. Turn it on (and off and on again if it was paired to your phone), keep it near the Pi, and try again.</div><button class="btn" id="again">Search again</button></div>`;
+      $("#again", s.el).onclick = () => { s.close(); findPrinter(); };
+      return;
+    }
+    s.content.innerHTML = `<div class="group" style="margin-top:8px">${r.devices.map((d, i) => `<button class="row" data-i="${i}"><span class="ico">${I.qr}</span><div class="main"><div class="t">${esc(d.name)}</div><div class="s">${esc(d.address)} · signal ${d.rssi ?? "?"}</div></div>${I.chev}</button>`).join("")}</div>`;
+    $$("[data-i]", s.el).forEach((b) => (b.onclick = async () => {
+      const d = r.devices[+b.dataset.i];
+      pr = await PUT("api/printer", { address: d.address, name: d.name }).catch(fail) || pr;
+      s.close(); haptic(15); toast(`Using ${d.name}`); draw();
+    }));
+  };
+  draw();
+}, "more");
 
 // ------------------------------------------------------------------ activity
 route(/^\/activity$/, async (view) => {
@@ -1392,6 +1493,7 @@ route(/^\/more$/, async (view) => {
       <a class="row" href="#/items?low=1"><span class="ico" style="background:#ff3b30">${I.alert}</span><div class="main">Low stock</div><span class="v">${s.low || 0}</span>${I.chev}</a>
       <a class="row" href="#/duplicates"><span class="ico" style="background:#ff9500">${I.copy}</span><div class="main">Duplicates</div><span class="v">${s.duplicates || ""}</span>${I.chev}</a>
       <button class="row" id="scan"><span class="ico" style="background:#5856d6">${I.qr}</span><div class="main">Scan label / barcode</div>${I.chev}</button>
+      <a class="row" href="#/printer"><span class="ico" style="background:#34c759">${I.tag}</span><div class="main">Label printer</div>${I.chev}</a>
     </div>
     <div class="section-h">Inventory value</div>
     <div class="group"><div class="row"><div class="main">Total value</div><span class="v">${money(s.total_value)}</span></div>

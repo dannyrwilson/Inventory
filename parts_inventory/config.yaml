@@ -1,5 +1,5 @@
 name: Parts Inventory
-version: "1.5.0"
+version: "1.6.0"
 slug: parts_inventory
 description: Photo-first inventory for all your parts. SQLite, search, linked items, AI photo identification.
 url: https://github.com/dannyrwilson/Inventory
@@ -18,6 +18,7 @@ ports:
 ports_description:
   8099/tcp: Direct access (optional; set a password if you enable this)
 backup: hot
+host_dbus: true
 options:
   ai_provider: openai
   openai_api_key: ""

@@ -20,6 +20,8 @@ from db import DB, RELATIONS, ITEM_FIELDS, now  # noqa: E402
 import ai  # noqa: E402
 import taxonomy  # noqa: E402
 import dupes  # noqa: E402
+import niimbot  # noqa: E402
+from printer_service import PrinterService  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("inventory")
@@ -959,6 +961,87 @@ def ignore_duplicates():
         return err("Pick at least two items")
     dup.ignore(ids)
     return jsonify({"ok": True})
+
+
+# label printer (NIIMBOT D11 / D11_H via the Pi's Bluetooth)
+printer = PrinterService()
+PRINTER_DEFAULTS = {"address": "", "name": "", "label_mm": 40, "task": "auto"}
+
+
+def printer_settings():
+    r = db.one("SELECT value FROM meta WHERE key='printer'")
+    out = dict(PRINTER_DEFAULTS)
+    if r:
+        try:
+            out.update(json.loads(r["value"]))
+        except ValueError:
+            pass
+    return out
+
+
+def save_printer_settings(d):
+    cur = printer_settings()
+    for k in PRINTER_DEFAULTS:
+        if k in d:
+            cur[k] = d[k]
+    cur["label_mm"] = max(20, min(80, int(cur.get("label_mm") or 40)))
+    if cur["task"] not in ("auto", "legacy"):
+        cur["task"] = "auto"
+    with db.tx() as c:
+        c.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('printer', ?)", (json.dumps(cur),))
+    return cur
+
+
+@app.get("/api/printer")
+def get_printer():
+    return jsonify({**printer_settings(), "available": printer.available()})
+
+
+@app.put("/api/printer")
+def put_printer():
+    return jsonify({**save_printer_settings(body()), "available": printer.available()})
+
+
+@app.post("/api/printer/scan")
+def scan_printers():
+    if not printer.available():
+        return err("Bluetooth support is not installed in this add-on build.", 503)
+    try:
+        return jsonify({"devices": printer.scan(6)})
+    except Exception as e:
+        log.warning("Bluetooth scan failed: %s", e)
+        return err("Bluetooth scan failed. Make sure the Pi's Bluetooth is on and the add-on was "
+                   "restarted after updating.", 502)
+
+
+@app.post("/api/printer/print")
+def print_labels():
+    labels = [l for l in (body().get("labels") or []) if l.get("title") or l.get("code")][:50]
+    if not labels:
+        return err("Nothing to print")
+    st = printer_settings()
+    if not st["address"]:
+        return err("No printer set up yet. Go to More → Label printer.", 400)
+    try:
+        return jsonify(printer.print_labels(st["address"], labels, st["label_mm"], st["task"]))
+    except niimbot.PrinterError as e:
+        return err(str(e), 502)
+    except Exception as e:
+        log.exception("Print failed")
+        return err(f"Printing failed: {e}", 502)
+
+
+@app.get("/api/printer/preview.png")
+def printer_preview():
+    a = request.args
+    st = printer_settings()
+    profile = niimbot.guess_profile(st["name"])
+    mm = max(20, min(80, int(a.get("mm") or st["label_mm"])))
+    _, img = niimbot.render_label(profile, a.get("title", "Label"), a.get("sub", ""), a.get("code", ""), mm)
+    img = img.resize((img.width * 3, img.height * 3), 0)  # nearest: crisp preview
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return Response(buf.getvalue(), mimetype="image/png", headers={"Cache-Control": "no-cache"})
 
 
 # import / export
